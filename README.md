@@ -12,6 +12,15 @@ Einmalig Docker Desktop (macOS/Windows) oder Docker Engine mit Docker Compose v2
 
 Der erste Start baut das Anwendungsimage und legt `data/` für Datenbank, Live-Events, Medien und die verknüpfte Sitzung an. Der Viewer ist standardmäßig nur unter `http://127.0.0.1:8000` erreichbar. Ein anderer Port kann in `.env` als `VIEWER_PORT=8010` oder direkt in der Umgebung gesetzt werden. Bei belegtem Port wird kein fremder Prozess beendet.
 
+Unter Linux `./start.sh` als normaler Benutzer ausführen, nicht mit `sudo`. Die Container schreiben mit der Benutzer-ID des aufrufenden Benutzers in `data/`. Wurde der Ordner zuvor von Docker oder durch einen Start mit `sudo` als `root` angelegt, kann die Bridge wegen fehlender Schreibrechte als „unhealthy“ ausfallen. Eigentümer einmalig korrigieren und erneut starten:
+
+```sh
+sudo chown -R "$(id -u):$(id -g)" data
+./start.sh
+```
+
+Dabei bleiben die Archivdateien erhalten.
+
 Beenden, ohne Archivdaten zu löschen:
 
 ```sh
