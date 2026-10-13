@@ -26,6 +26,7 @@ class Chat(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     identity_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     title: Mapped[str] = mapped_column(String(500))
+    alias: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
 
 
@@ -55,6 +56,8 @@ class MessageVersion(Base):
     message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), index=True)
     text: Mapped[str] = mapped_column(Text)
     raw_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sender: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
 
 
@@ -67,3 +70,17 @@ class Media(Base):
     original_name: Mapped[str] = mapped_column(String(255))
     sha256: Mapped[str] = mapped_column(String(64), index=True)
     stored_path: Mapped[str] = mapped_column(Text)
+
+
+class ContactMapping(Base):
+    __tablename__ = "contact_mappings"
+
+    lid: Mapped[str] = mapped_column(String(255), primary_key=True)
+    phone_jid: Mapped[str] = mapped_column(String(255))
+
+
+class ArchiveMetadata(Base):
+    __tablename__ = "archive_metadata"
+
+    key: Mapped[str] = mapped_column(String(50), primary_key=True)
+    value: Mapped[str] = mapped_column(String(255))

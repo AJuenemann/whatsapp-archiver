@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node index.mjs",
-    "test": "node --test test-message-metadata.mjs test-bridge-startup.mjs"
+    "test": "node --test test-message-metadata.mjs test-bridge-startup.mjs test-snapshot-proof.mjs"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc14",

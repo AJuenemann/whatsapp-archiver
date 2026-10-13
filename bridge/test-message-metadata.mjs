@@ -4,7 +4,18 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { messageMetadata, secureDirectory } from './message-metadata.mjs'
+import { messageChatName, messageMetadata, secureDirectory } from './message-metadata.mjs'
+
+test('own push name never becomes the recipient name', () => {
+  assert.equal(messageChatName({ key: { fromMe: true }, pushName: 'Andreas' }, '11879896318161@lid'), null)
+  assert.equal(messageChatName({ key: { fromMe: false }, pushName: 'Alex' }, '11879896318161@lid'), 'Alex')
+})
+
+test('group participants and raw JIDs never become chat names', () => {
+  assert.equal(messageChatName({ key: { fromMe: false }, pushName: 'Andreas' }, '123@g.us'), null)
+  assert.equal(messageChatName({ key: { fromMe: false }, pushName: '123@lid' }, '456@lid'), null)
+  assert.equal(messageChatName({}, '456@lid'), null)
+})
 
 test('normal inbound message has a stable source id and sender', () => {
   assert.deepEqual(
@@ -34,5 +45,16 @@ test('outbound message is attributed to the archive account', () => {
   assert.deepEqual(
     messageMetadata({}, 'group@g.us', { id: 'message-2', fromMe: true }),
     { sourceId: 'message-2:out:', sender: 'You' },
+  )
+})
+
+test('history group sender can live outside the key without changing the source id', () => {
+  assert.deepEqual(
+    messageMetadata(
+      { participant: '127144655077428@lid' },
+      '120363427522330874@g.us',
+      { id: 'history-message', fromMe: false },
+    ),
+    { sourceId: 'history-message:in:', sender: '127144655077428@lid' },
   )
 })

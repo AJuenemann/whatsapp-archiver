@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 from collections.abc import Callable
@@ -13,10 +14,11 @@ from pathlib import Path, PurePosixPath
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
-from .models import Chat, Media, Message, MessageVersion
+from .models import Chat, ContactMapping, Media, Message, MessageVersion
 
 SCAN_RETRY_DELAY_SECONDS = 30
 _EVENT_RETRY_AFTER: dict[Path, float] = {}
+logger = logging.getLogger("whatsapp_archive")
 
 
 def _identity(value: str) -> str:
@@ -31,6 +33,19 @@ def _safe_media_name(name: str) -> str:
 
 def ingest_whatsapp_event(event: dict, session_factory: Callable, media_root: Path) -> None:
     event_type = event.get("type")
+    if event_type == "contact_mapping":
+        lid, phone = event.get("lid"), event.get("phoneJid")
+        if not isinstance(lid, str) or not re.fullmatch(r"\d+@lid", lid):
+            raise ValueError("Invalid contact LID")
+        if not isinstance(phone, str) or not re.fullmatch(r"\d+@s\.whatsapp\.net", phone):
+            raise ValueError("Invalid contact phone JID")
+        with session_factory.begin() as session:
+            mapping = session.get(ContactMapping, lid)
+            if mapping is None:
+                session.add(ContactMapping(lid=lid, phone_jid=phone))
+            elif mapping.phone_jid != phone:
+                raise ValueError("Conflicting archived contact mapping")
+        return
     jid = event.get("jid")
     if event_type not in {"chat", "message", "delete"} or not isinstance(jid, str) or not jid:
         raise ValueError("Invalid WhatsApp event")
@@ -75,7 +90,10 @@ def ingest_whatsapp_event(event: dict, session_factory: Callable, media_root: Pa
                 )
                 session.add(message)
             elif message.deleted_at is None:
-                session.add(MessageVersion(message_id=message.id, text=message.text, raw_data=message.raw_data))
+                session.add(MessageVersion(
+                    message_id=message.id, text=message.text, raw_data=message.raw_data,
+                    sender=message.sender, sent_at=message.sent_at,
+                ))
                 message.deleted_at = now
             return
 
@@ -96,9 +114,12 @@ def ingest_whatsapp_event(event: dict, session_factory: Callable, media_root: Pa
             )
             session.add(message)
             session.flush()
-        elif message.text != text or message.raw_data != raw_data:
-            if message.text != "[Nachricht gelöscht]":
-                session.add(MessageVersion(message_id=message.id, text=message.text, raw_data=message.raw_data))
+        elif not event.get("historical") and (message.text != text or message.raw_data != raw_data):
+            if session.get_bind().dialect.name != "sqlite":
+                session.add(MessageVersion(
+                    message_id=message.id, text=message.text, raw_data=message.raw_data,
+                    sender=message.sender, sent_at=message.sent_at,
+                ))
             message.text = text
             message.raw_data = raw_data
 
@@ -139,5 +160,6 @@ def scan_whatsapp_events(events_root: Path, session_factory: Callable, media_roo
             _EVENT_RETRY_AFTER.pop(path, None)
             processed += 1
         except (OSError, ValueError, TypeError, SQLAlchemyError):
+            logger.exception("Could not archive event %s; keeping it for retry", path.name)
             _EVENT_RETRY_AFTER[path] = time.monotonic() + SCAN_RETRY_DELAY_SECONDS
     return processed

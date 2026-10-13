@@ -1,4 +1,5 @@
 import hashlib
+import base64
 import importlib
 import json
 import sys
@@ -164,6 +165,25 @@ def test_root_page_renders_and_keeps_js_template_literal(monkeypatch, tmp_path):
                 source_key="source-secret",
             )
         )
+        status_reply = Message(
+            chat_id=chat.id,
+            identity_key="status-reply",
+            sent_at=datetime(2025, 12, 31, 22, 19, 35),
+            sender="Ada",
+            text="Status reply text",
+            raw_data=json.dumps({"message": {"extendedTextMessage": {
+                "text": "Status reply text",
+                "contextInfo": {
+                    "remoteJid": "status@broadcast",
+                    "quotedMessage": {"imageMessage": {
+                        "caption": "Status image caption",
+                        "fileSha256": base64.b64encode(bytes.fromhex(f"{1:064x}")).decode(),
+                    }},
+                },
+            }}}),
+            source_key="status-reply-source",
+        )
+        session.add(status_reply)
         session.add(
             Message(
                 chat_id=chat.id,
@@ -261,6 +281,16 @@ def test_root_page_renders_and_keeps_js_template_literal(monkeypatch, tmp_path):
     assert "Export importieren" not in html
     assert 'action="/imports"' not in html
     assert "window.location.reload()" in html
+    assert "whatsapp-archive-chat-list-scroll" in html
+    assert "savedChatListScroll.scrollTop" in html
+    assert "savedChatListScroll.scrollLeft" in html
+    assert "position: sticky; top: 12px" in html
+    assert "max-height: calc(100vh - 24px)" in html
+    assert "overflow-y: auto; overscroll-behavior: contain" in html
+    assert "window.scrollTo(0, savedChatListScroll" not in html
+    assert "Antwort auf WhatsApp-Status · Bild" in html
+    assert "Status image caption" in html
+    assert 'class="status-reply-media" href="/media/' in html
     assert '<img src="/media/' in html
     assert '<audio controls preload="none"' in html
     assert '<video controls preload="metadata"' in html
@@ -324,7 +354,8 @@ def test_root_page_renders_and_keeps_js_template_literal(monkeypatch, tmp_path):
     )
     assert renamed.status_code == 303
     with app_module.SessionFactory() as session:
-        assert session.get(Chat, lid_chat_id).title == "Emilian Weis"
+        assert session.get(Chat, lid_chat_id).alias == "Emilian Weis"
+        assert session.get(Chat, lid_chat_id).title == "123456789@lid"
 
 
 def test_live_event_scan_advances_viewer_revision(monkeypatch, tmp_path):

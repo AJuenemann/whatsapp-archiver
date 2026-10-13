@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import { createWriteStream } from 'node:fs'
-import { chmod, mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, open, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -17,12 +17,15 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys'
 import pino from 'pino'
 import QRCode from 'qrcode'
-import { messageMetadata, secureDirectory } from './message-metadata.mjs'
+import { messageChatName, messageMetadata, secureDirectory } from './message-metadata.mjs'
+import { fileHash, verifyPairingSnapshot } from './snapshot-proof.mjs'
+import { archivedMediaMessage, downloadWithReupload, referencedMediaMessage, reuploadMedia } from './media-download.mjs'
 
 const dataRoot = path.resolve(process.env.DATA_DIR || '/data')
 const authRoot = path.join(dataRoot, 'whatsapp-auth')
 const eventRoot = path.join(dataRoot, 'whatsapp-events')
 const mediaRoot = path.join(dataRoot, 'media', 'whatsapp')
+const backupRoot = path.resolve(process.env.ARCHIVE_BACKUP_DIR || path.join(dataRoot, 'backups'))
 const port = Number(process.env.BRIDGE_PORT || 8765)
 const maxRetryMediaRequestBytes = 2 * 1024 * 1024
 const testMode = process.env.WHATSAPP_BRIDGE_MODE === 'mock'
@@ -48,8 +51,14 @@ await Promise.all([secureDirectory(authRoot), secureDirectory(eventRoot), secure
 async function writeEvent(event) {
   const temporary = path.join(eventRoot, `.${randomUUID()}.part`)
   const destination = path.join(eventRoot, `${Date.now()}-${randomUUID()}.json`)
-  await writeFile(temporary, JSON.stringify(event), { mode: 0o600 })
+  await writeFile(temporary, JSON.stringify(event), { mode: 0o600, flush: true })
   await rename(temporary, destination)
+  const directory = await open(eventRoot, 'r')
+  try {
+    await directory.sync()
+  } finally {
+    await directory.close()
+  }
 }
 
 function isRawJid(value) {
@@ -63,6 +72,7 @@ async function saveLidMappings(mappings = []) {
     const lids = phoneToLids.get(pn) || new Set()
     lids.add(lid)
     phoneToLids.set(pn, lids)
+    await writeEvent({ type: 'contact_mapping', lid, phoneJid: pn })
     const name = chatNames.get(pn) || chatNames.get(lid)
     if (name && !isRawJid(name)) {
       chatNames.set(pn, name)
@@ -151,12 +161,15 @@ function safeFileName(value) {
 }
 
 async function saveMedia(message) {
-  const content = normalizeMessageContent(message.message)
+  const candidate = archivedMediaMessage(message)
+  const content = candidate.message
   const type = getContentType(content)
-  if (!['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(type)) {
+  if (!['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage',
+    'extendedTextMessage'].includes(type)) {
     return null
   }
   const item = content[type]
+  if (type === 'extendedTextMessage' && !item.thumbnailDirectPath) return null
   const declaredSize = Number(item.fileLength?.toString?.() ?? item.fileLength ?? 0)
   const maxSize = 200 * 1024 * 1024
   if (declaredSize > maxSize) {
@@ -169,10 +182,11 @@ async function saveMedia(message) {
   const digest = createHash('sha256')
   let size = 0
   try {
-    const stream = await downloadMediaMessage(message, 'stream', {}, {
-      logger,
-      reuploadRequest: (failedMessage) => activeSocket.updateMediaMessage(failedMessage),
-    })
+    const stream = await downloadWithReupload(
+      candidate,
+      (candidate) => downloadMediaMessage(candidate, 'stream', {}),
+      (candidate) => reuploadMedia(candidate, activeSocket),
+    )
     await pipeline(
       stream,
       new Transform({
@@ -192,23 +206,46 @@ async function saveMedia(message) {
     )
     if (!size) return null
     const sha256 = digest.digest('hex')
+    const expectedHash = item.fileSha256 ||
+      (type === 'extendedTextMessage' ? item.thumbnailSha256 : undefined)
+    if (expectedHash && Buffer.from(expectedHash).toString('hex') !== sha256) {
+      throw new Error('Downloaded media does not match the WhatsApp checksum')
+    }
+    if (declaredSize > 0 && size !== declaredSize) {
+      throw new Error('Downloaded media does not match the WhatsApp file size')
+    }
+    const name = safeFileName(item.fileName ||
+      `${message.key.id || 'media'}.${type === 'extendedTextMessage' ? 'jpg' : type}`)
     const relative = path.posix.join(
       'whatsapp',
       sha256.slice(0, 2),
-      `${sha256}-${safeFileName(item.fileName || `${message.key.id || 'media'}.${type}`)}`,
+      `${sha256}-${name}`,
     )
     const destination = path.join(dataRoot, 'media', relative)
     await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 })
+    const completed = await open(temporary, 'r')
     try {
-      await rename(temporary, destination)
+      await completed.sync()
+    } finally {
+      await completed.close()
+    }
+    try {
+      await link(temporary, destination)
     } catch (error) {
       if (error.code !== 'EEXIST') throw error
+      if (await fileHash(destination) !== sha256) throw new Error('Existing archived media checksum mismatch')
+    }
+    const directory = await open(path.dirname(destination), 'r')
+    try {
+      await directory.sync()
+    } finally {
+      await directory.close()
     }
     return {
       sha256,
       path: relative,
-      name: safeFileName(item.fileName || `${message.key.id || 'media'}.${type}`),
-      mimeType: item.mimetype || 'application/octet-stream',
+      name,
+      mimeType: item.mimetype || (type === 'extendedTextMessage' ? 'image/jpeg' : 'application/octet-stream'),
     }
   } finally {
     await rm(temporary, { force: true })
@@ -232,7 +269,7 @@ async function saveChat(chat) {
   status.history.chats = chatNames.size
 }
 
-async function saveMessage(message) {
+async function saveMessage(message, historical = false) {
   const jid = message.key?.remoteJid || message.key?.remoteJidAlt
   const protocol = message.message?.protocolMessage
   const protocolType = protocol?.type
@@ -244,7 +281,7 @@ async function saveMessage(message) {
   if (!jid || !id || jid === 'status@broadcast' || jid.endsWith('@broadcast')) return
   knownChatIds.add(jid)
   const metadata = messageMetadata(message, jid, sourceKey)
-  const title = chatNames.get(jid) || (isRawJid(message.pushName) ? null : message.pushName) || jid
+  const title = chatNames.get(jid) || messageChatName(message, jid) || jid
   if (!isRawJid(title)) chatNames.set(jid, title)
   if (isDelete) {
     await writeEvent({
@@ -279,6 +316,7 @@ async function saveMessage(message) {
     text: messageText(message),
     media,
     mediaError,
+    historical,
     rawData: message,
   })
   status.history.messages += 1
@@ -336,7 +374,7 @@ export async function startWhatsApp() {
     await saveLidMappings(lidPnMappings)
     for (const contact of contacts) await saveContact(contact)
     for (const chat of chats) await saveChat(chat)
-    for (const message of messages) await saveMessage(message)
+    for (const message of messages) await saveMessage(message, true)
   })
 
   socket.ev.on('chats.upsert', async (chats) => {
@@ -361,7 +399,7 @@ export async function startWhatsApp() {
   })
 }
 
-async function resetLocalPairing() {
+async function resetLocalPairing(snapshotName) {
   if (status.state !== 'logged_out') {
     const error = new Error('Pairing can only be reset after logout')
     error.statusCode = 409
@@ -375,6 +413,13 @@ async function resetLocalPairing() {
 
   resetInProgress = true
   try {
+    try {
+      await verifyPairingSnapshot(backupRoot, snapshotName, path.join(dataRoot, 'archive.db.identity'))
+    } catch (cause) {
+      const error = new Error('Archive snapshot verification failed; pairing was not reset', { cause })
+      error.statusCode = 409
+      throw error
+    }
     await rm(authRoot, { recursive: true, force: true })
     await secureDirectory(authRoot)
     status.state = 'starting'
@@ -398,22 +443,33 @@ async function resolveLidPhones(jids) {
   const resolved = {}
   for (let index = 0; index < lidUsers.length; index++) {
     const phoneUser = stored[reverseKeys[index]]
-    if (/^\d+$/.test(phoneUser || '')) resolved[`${lidUsers[index]}@lid`] = `${phoneUser}@s.whatsapp.net`
+    if (/^\d+$/.test(phoneUser || '')) {
+      const lid = `${lidUsers[index]}@lid`
+      const pn = `${phoneUser}@s.whatsapp.net`
+      resolved[lid] = pn
+      if (!lidToPhone.has(lid)) await saveLidMappings([{ lid, pn }])
+    }
   }
   return resolved
 }
 
 const mediaRetriesInProgress = new Set()
 
-async function retryVideo(message) {
+async function retryVideo(message, part = '') {
   const jid = message.key?.remoteJid || message.key?.remoteJidAlt
   const id = message.key?.id
-  if (!activeSocket || !status.paired || !jid || !id || getContentType(normalizeMessageContent(message.message)) !== 'videoMessage') {
-    const error = new Error('A connected session and a stored video message are required')
+  const candidate = part ? referencedMediaMessage(message, part, activeSocket) : message
+  const content = archivedMediaMessage(candidate).message
+  const kind = getContentType(content)
+  if (!activeSocket || !status.paired || !jid || !id ||
+      !['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage',
+        'extendedTextMessage'].includes(kind) ||
+      (kind === 'extendedTextMessage' && !content[kind].thumbnailDirectPath)) {
+    const error = new Error('A connected session and a supported stored media message are required')
     error.statusCode = 400
     throw error
   }
-  const retryKey = `${jid}:${id}`
+  const retryKey = `${jid}:${id}:${part}`
   if (mediaRetriesInProgress.has(retryKey)) {
     const error = new Error('This video is already being downloaded')
     error.statusCode = 409
@@ -421,13 +477,15 @@ async function retryVideo(message) {
   }
   mediaRetriesInProgress.add(retryKey)
   try {
-    const refreshedMessage = await activeSocket.updateMediaMessage(message)
-    const result = await saveMessage(refreshedMessage)
-    if (!result?.media) {
-      const error = new Error(result?.mediaError || 'MediaDownloadError')
-      error.statusCode = 503
-      throw error
-    }
+    const media = await saveMedia(candidate)
+    if (!media) throw new Error('Media download returned no data')
+    const metadata = messageMetadata(message, jid, message.key)
+    await writeEvent({
+      type: 'message', jid, title: chatNames.get(jid) || jid,
+      sourceId: metadata.sourceId, timestamp: timestampOf(message),
+      sender: metadata.sender, text: messageText(message), media,
+      rawData: message, historical: true,
+    })
     return { state: 'media_retried' }
   } finally {
     mediaRetriesInProgress.delete(retryKey)
@@ -450,13 +508,19 @@ const server = createServer(async (request, response) => {
       }
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8'), BufferJSON.reviver)
       const message = proto.WebMessageInfo.fromObject(body.message)
-      const result = await retryVideo(message)
+      const result = await retryVideo(message, body.part || '')
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
       response.end(JSON.stringify(result))
     } catch (error) {
-      const statusCode = error.statusCode || 400
+      const statusCode = error.statusCode || 503
       response.writeHead(statusCode, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-      response.end(JSON.stringify({ error: statusCode === 503 ? 'Video could not be downloaded' : error.message }))
+      console.error('Archived media retry failed', {
+        name: error?.name, status: error?.output?.statusCode ?? error?.status ?? error?.statusCode ?? null,
+      })
+      response.end(JSON.stringify({
+        error: error.statusCode ? error.message :
+          'Medium konnte nicht geladen werden. WhatsApp stellt die Datei möglicherweise nicht mehr bereit.',
+      }))
     }
     return
   }
@@ -486,7 +550,7 @@ const server = createServer(async (request, response) => {
     return
   }
   if (request.method === 'POST' && pathname === '/pairing/reset') {
-    resetLocalPairing().then((nextStatus) => {
+    resetLocalPairing(request.headers['x-archive-snapshot']).then((nextStatus) => {
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
       response.end(JSON.stringify(nextStatus))
     }).catch((error) => {

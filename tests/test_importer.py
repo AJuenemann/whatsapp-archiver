@@ -72,7 +72,7 @@ class LiveEventTests(unittest.TestCase):
             message = session.scalar(select(Message))
             self.assertEqual(message.text, "Message arrived after its delete event")
             self.assertIsNotNone(message.deleted_at)
-            self.assertEqual(session.scalar(select(func.count(MessageVersion.id))), 0)
+            self.assertEqual(session.scalar(select(func.count(MessageVersion.id))), 1)
 
     def test_whatsapp_event_spool_is_removed_after_import(self):
         events_root = self.root / "events"
@@ -107,6 +107,7 @@ class LiveEventTests(unittest.TestCase):
 
         self.assertTrue({"source_key", "raw_data", "deleted_at"}.issubset(columns))
         self.assertIn("message_versions", inspect(upgraded).get_table_names())
+        self.assertIn("alias", {column["name"] for column in inspect(upgraded).get_columns("chats")})
         upgraded.dispose()
 
 

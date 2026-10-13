@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import html
 import json
 import logging
 import mimetypes
 import os
+import sqlite3
+from typing import Annotated
 from datetime import timezone
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Form, HTTPException, Query
 from fastapi import Request as FastAPIRequest
@@ -20,14 +24,17 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .database import create_database
-from .importer import scan_whatsapp_events
-from .models import Chat, Media, Message, MessageVersion
+from .importer import ingest_whatsapp_event, scan_whatsapp_events
+from .models import ArchiveMetadata, Chat, ContactMapping, Media, Message, MessageVersion
+from .media import MEDIA_LABELS, media_content, media_kind, media_parts
+from .protection import ARCHIVE_LOCK, create_snapshot
 
 logger = logging.getLogger("whatsapp_archive")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = Path(os.getenv("DATA_DIR", PROJECT_ROOT / "data"))
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", DATA_ROOT / "media"))
 WHATSAPP_EVENTS_DIR = Path(os.getenv("WHATSAPP_EVENTS_DIR", DATA_ROOT / "whatsapp-events"))
+BACKUP_DIR = Path(os.getenv("ARCHIVE_BACKUP_DIR", DATA_ROOT / "backups"))
 WHATSAPP_BRIDGE_URL = os.getenv("WHATSAPP_BRIDGE_URL", "http://whatsapp-bridge:8765").rstrip("/")
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,6 +44,7 @@ engine, SessionFactory = create_database(DATABASE_URL)
 app = FastAPI(title="WhatsApp Archive", docs_url=None, redoc_url=None)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
 _LIVE_REVISION = 0
+_PROTECTION_ERROR: str | None = None
 
 _INLINE_MEDIA_TYPES = {
     "image/jpeg",
@@ -148,9 +156,10 @@ async def _live_event_watcher() -> None:
 
 def _scan_live_events() -> int:
     global _LIVE_REVISION
-    processed = scan_whatsapp_events(WHATSAPP_EVENTS_DIR, SessionFactory, MEDIA_DIR)
-    _LIVE_REVISION += processed
-    return processed
+    with ARCHIVE_LOCK:
+        processed = scan_whatsapp_events(WHATSAPP_EVENTS_DIR, SessionFactory, MEDIA_DIR)
+        _LIVE_REVISION += processed
+        return processed
 
 
 @app.on_event("startup")
@@ -189,7 +198,58 @@ def _whatsapp_status() -> dict:
             select(func.count(Message.id)).where(Message.source_key.is_not(None))
         ) or 0
     status["live_revision"] = _LIVE_REVISION
+    status["archive_protection"] = _protection_status()
     return status
+
+
+def _protection_status() -> dict:
+    with SessionFactory() as session:
+        archive_id = session.get(ArchiveMetadata, "archive_id")
+        identity = archive_id.value if archive_id is not None else None
+    latest = None
+    for path in BACKUP_DIR.glob("*/manifest.json"):
+        if path.parent.name.startswith("."):
+            continue
+        try:
+            manifest = json.loads(path.read_text("utf-8"))
+            if manifest["inventory"]["archive_id"] == identity:
+                candidate = {"snapshot": path.parent.name, "created_at": manifest["created_at"]}
+                if latest is None or candidate["created_at"] > latest["created_at"]:
+                    latest = candidate
+        except (OSError, ValueError, KeyError, TypeError):
+            logger.exception("Could not read archive snapshot status")
+            return {"last_snapshot": None, "error": "Sicherungsstatus konnte nicht gelesen werden."}
+    return {
+        "last_snapshot": latest,
+        "pending_events": sum(1 for _ in WHATSAPP_EVENTS_DIR.glob("*.json")),
+        "independent_copy_required": True,
+        "error": _PROTECTION_ERROR,
+    }
+
+
+def _secure_archive() -> Path:
+    global _PROTECTION_ERROR
+    try:
+        snapshot = create_snapshot(engine, MEDIA_DIR, WHATSAPP_EVENTS_DIR, BACKUP_DIR)
+        _PROTECTION_ERROR = None
+        return snapshot
+    except (OSError, ValueError, sqlite3.Error) as error:
+        logger.exception("Archive snapshot failed; pairing must remain unchanged")
+        _PROTECTION_ERROR = "Archivabsicherung fehlgeschlagen. Keine Neukopplung ausgeführt."
+        raise HTTPException(
+            status_code=503,
+            detail="Archiv konnte nicht abgesichert werden. Keine Neukopplung ausgeführt. "
+            "Speicherplatz, Dateirechte und Medienintegrität prüfen.",
+        ) from error
+
+
+@app.post("/api/archive/snapshot")
+def secure_archive(request: FastAPIRequest) -> JSONResponse:
+    origin = request.headers.get("origin")
+    if origin is None or origin.rstrip("/") != str(request.base_url).rstrip("/"):
+        raise HTTPException(status_code=403, detail="Same-origin request required")
+    snapshot = _secure_archive()
+    return JSONResponse({"snapshot": snapshot.name, "verified": True}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/whatsapp/status")
@@ -202,14 +262,17 @@ def reset_whatsapp_pairing(request: FastAPIRequest) -> JSONResponse:
     origin = request.headers.get("origin")
     if origin is None or origin.rstrip("/") != str(request.base_url).rstrip("/"):
         raise HTTPException(status_code=403, detail="Same-origin request required")
-    request = Request(
+    if _whatsapp_status().get("state") != "logged_out":
+        raise HTTPException(status_code=409, detail="Pairing can only be reset after logout")
+    snapshot = _secure_archive()
+    bridge_request = Request(
         f"{WHATSAPP_BRIDGE_URL}/pairing/reset",
         data=b"",
-        headers={"Accept": "application/json"},
+        headers={"Accept": "application/json", "X-Archive-Snapshot": snapshot.name},
         method="POST",
     )
     try:
-        with urlopen(request, timeout=5) as response:
+        with urlopen(bridge_request, timeout=180) as response:
             return JSONResponse(json.load(response), headers={"Cache-Control": "no-store"})
     except HTTPError as error:
         try:
@@ -217,32 +280,57 @@ def reset_whatsapp_pairing(request: FastAPIRequest) -> JSONResponse:
         except (ValueError, OSError):
             detail = {"error": "Pairing reset rejected"}
         return JSONResponse(detail, status_code=error.code, headers={"Cache-Control": "no-store"})
-    except Exception as error:
+    except (OSError, ValueError) as error:
+        logger.exception("Could not start local pairing; verified archive snapshot retained")
         raise HTTPException(status_code=503, detail="Could not start local pairing") from error
 
 
 @app.post("/api/media/{message_id}/retry")
-def retry_video_media(message_id: int, request: FastAPIRequest) -> JSONResponse:
+def retry_video_media(message_id: int, request: FastAPIRequest, part: str = "") -> JSONResponse:
     origin = request.headers.get("origin")
     if origin is None or origin.rstrip("/") != str(request.base_url).rstrip("/"):
         raise HTTPException(status_code=403, detail="Same-origin request required")
     with SessionFactory() as session:
         message = session.get(Message, message_id)
         if message is None or not message.raw_data:
-            raise HTTPException(status_code=404, detail="Video not found")
+            raise HTTPException(status_code=404, detail="Medium nicht gefunden")
         try:
             raw_data = json.loads(message.raw_data)
         except (TypeError, ValueError) as error:
-            raise HTTPException(status_code=400, detail="Video data is invalid") from error
-        content = raw_data.get("message") if isinstance(raw_data, dict) else None
-        if not isinstance(content, dict) or "videoMessage" not in content:
-            raise HTTPException(status_code=400, detail="Message is not a video")
-        if session.scalar(select(Media.id).where(Media.message_id == message_id)) is not None:
+            raise HTTPException(status_code=400, detail="Ungültige Mediendaten") from error
+        if not isinstance(raw_data, dict):
+            raise HTTPException(status_code=400, detail="Nachricht enthält kein unterstütztes Medium")
+        if part:
+            try:
+                item = media_parts(raw_data).get(part)
+            except ValueError as error:
+                raise HTTPException(status_code=400, detail="Ungültige Medienstruktur") from error
+            if item is None:
+                raise HTTPException(status_code=400, detail="Unbekannter Medienverweis")
+        else:
+            kind = media_kind(raw_data)
+            content = media_content(raw_data)
+            if kind is None or content is None:
+                raise HTTPException(status_code=400, detail="Nachricht enthält kein unterstütztes Medium")
+            item = content[kind]
+        encoded_hash = item.get("fileSha256") or item.get("thumbnailSha256")
+        expected_hash = None
+        if encoded_hash:
+            try:
+                expected_hash = base64.b64decode(encoded_hash, validate=True).hex()
+            except (TypeError, ValueError) as error:
+                raise HTTPException(status_code=400, detail="Ungültige Medienprüfsumme") from error
+        available_query = select(Media.id)
+        if expected_hash:
+            available_query = available_query.where(Media.sha256 == expected_hash)
+        if not part or not expected_hash:
+            available_query = available_query.where(Media.message_id == message_id)
+        if session.scalar(available_query) is not None:
             return JSONResponse({"state": "already_available"})
 
     bridge_request = Request(
         f"{WHATSAPP_BRIDGE_URL}/media/retry",
-        data=json.dumps({"message": raw_data}).encode("utf-8"),
+        data=json.dumps({"message": raw_data, **({"part": part} if part else {})}).encode("utf-8"),
         headers={"Accept": "application/json", "Content-Type": "application/json"},
         method="POST",
     )
@@ -251,14 +339,20 @@ def retry_video_media(message_id: int, request: FastAPIRequest) -> JSONResponse:
             result = json.load(response)
         _scan_live_events()
         with SessionFactory() as session:
-            available = session.scalar(select(Media.id).where(Media.message_id == message_id)) is not None
+            available = session.scalar(available_query) is not None
         if not available:
-            return JSONResponse({"error": "Video is not available"}, status_code=503)
+            return JSONResponse({"error": "Medium wurde nicht im Archiv gespeichert"}, status_code=503)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
     except HTTPError as error:
-        return JSONResponse({"error": "Video could not be downloaded"}, status_code=error.code)
-    except Exception as error:
-        raise HTTPException(status_code=503, detail="Could not retry video download") from error
+        logger.warning("Bridge media retry failed for message %s: HTTP %s", message_id, error.code)
+        try:
+            detail = json.load(error)
+        except (ValueError, OSError):
+            detail = {"error": "Medium konnte nicht geladen werden"}
+        return JSONResponse(detail, status_code=error.code)
+    except (OSError, ValueError) as error:
+        logger.exception("Media retry failed for message %s", message_id)
+        raise HTTPException(status_code=503, detail="Medium konnte nicht geladen werden") from error
 
 
 def _display_message_text(message: Message) -> str:
@@ -279,6 +373,63 @@ def _display_message_text(message: Message) -> str:
         if stub_type:
             return _MESSAGE_STUB_LABELS.get(stub_type, "WhatsApp-Systemereignis")
     return message.text
+
+
+def _status_reply_context(
+    raw_data: str | None,
+    media_ids_by_hash: dict[str, int],
+) -> tuple[str, str | None]:
+    if not raw_data:
+        return "", None
+    try:
+        raw = json.loads(raw_data)
+    except (TypeError, ValueError):
+        return "", None
+    content = media_content(raw) if isinstance(raw, dict) else None
+    extended = content.get("extendedTextMessage") if content else None
+    context = extended.get("contextInfo") if isinstance(extended, dict) else None
+    if not isinstance(context, dict) or context.get("remoteJid") != "status@broadcast":
+        return "", None
+    quoted = context.get("quotedMessage")
+    if not isinstance(quoted, dict):
+        return '<aside class="status-reply"><strong>Antwort auf WhatsApp-Status</strong></aside>', None
+    media_item = next(
+        ((kind, item) for kind in ("imageMessage", "videoMessage", "audioMessage")
+         if isinstance((item := quoted.get(kind)), dict)),
+        None,
+    )
+    if media_item is None:
+        quote_text = quoted.get("conversation")
+        nested = quoted.get("extendedTextMessage")
+        if not isinstance(quote_text, str) and isinstance(nested, dict):
+            quote_text = nested.get("text")
+        kind = "Text"
+        item = {}
+    else:
+        kind, item = media_item
+        quote_text = item.get("caption")
+    label = {"imageMessage": "Bild", "videoMessage": "Video", "audioMessage": "Audio"}.get(kind, kind)
+    media_preview = ""
+    media_hash = None
+    digest = item.get("fileSha256")
+    if digest:
+        try:
+            media_hash = base64.b64decode(digest, validate=True).hex()
+            media_id = media_ids_by_hash.get(media_hash)
+        except (TypeError, ValueError):
+            media_id = None
+            media_hash = None
+        if media_id is not None and kind == "imageMessage":
+            media_preview = (
+                f'<a class="status-reply-media" href="/media/{media_id}">'
+                f'<img src="/media/{media_id}" loading="lazy" alt="Bild aus WhatsApp-Status"></a>'
+            )
+    caption = f"<p>{html.escape(quote_text)}</p>" if isinstance(quote_text, str) and quote_text else ""
+    return (
+        f'<aside class="status-reply"><strong>Antwort auf WhatsApp-Status · {html.escape(label)}</strong>'
+        f"{caption}{media_preview}</aside>",
+        media_hash if media_preview else None,
+    )
 
 
 def _reaction_details(message: Message) -> tuple[str, str] | None:
@@ -309,6 +460,22 @@ def _chat_activity_predicate():
     )
 
 
+def _visible_archived_message():
+    current = and_(
+        Message.text != "[protocolMessage]",
+        or_(Message.raw_data.is_(None), ~Message.raw_data.contains('"reactionMessage"')),
+        or_(Message.raw_data.is_(None), ~Message.raw_data.contains('"secretEncryptedMessage"')),
+    )
+    prior_content = select(MessageVersion.id).where(
+        MessageVersion.message_id == Message.id,
+        MessageVersion.text != "",
+        MessageVersion.text != "[protocolMessage]",
+        or_(MessageVersion.raw_data.is_(None), ~MessageVersion.raw_data.contains('"reactionMessage"')),
+        or_(MessageVersion.raw_data.is_(None), ~MessageVersion.raw_data.contains('"secretEncryptedMessage"')),
+    ).exists()
+    return or_(current, prior_content)
+
+
 def _display_reaction(text: str) -> str:
     result = []
     for index, character in enumerate(text):
@@ -327,15 +494,37 @@ def _display_chat_name(chat_id: int, title: str) -> str:
     return title
 
 
+def _archived_sender(message: Message) -> str | None:
+    if not message.sender or not message.sender.endswith("@g.us") or not message.raw_data:
+        return message.sender
+    try:
+        raw = json.loads(message.raw_data)
+    except (TypeError, ValueError):
+        logger.warning("Could not read archived sender metadata for message %s", message.id)
+        return message.sender
+    if not isinstance(raw, dict):
+        return message.sender
+    key = raw.get("key")
+    if not isinstance(key, dict) or key.get("fromMe") or key.get("remoteJid") != message.sender:
+        return message.sender
+    participant = key.get("participant") or key.get("participantAlt") or raw.get("participant")
+    return participant if isinstance(participant, str) and participant else message.sender
+
+
 def _resolve_lid_phone_jids(chats: list[tuple], senders: tuple[str, ...] | list[str] = ()) -> dict[str, str]:
     jids = [title for _chat_id, title, *_rest in chats if title.endswith("@lid") and title[:-4].isdigit()]
     jids.extend(sender for sender in senders if sender.endswith("@lid") and sender[:-4].isdigit())
     jids = list(dict.fromkeys(jids))
     if not jids:
         return {}
-    resolved: dict[str, str] = {}
-    for start in range(0, len(jids), 200):
-        batch = jids[start : start + 200]
+    with SessionFactory() as session:
+        resolved = {
+            mapping.lid: mapping.phone_jid
+            for mapping in session.scalars(select(ContactMapping).where(ContactMapping.lid.in_(jids)))
+        }
+    unknown = [jid for jid in jids if jid not in resolved]
+    for start in range(0, len(unknown), 200):
+        batch = unknown[start : start + 200]
         request = Request(
             f"{WHATSAPP_BRIDGE_URL}/resolve-lids",
             data=json.dumps({"jids": batch}).encode("utf-8"),
@@ -344,8 +533,16 @@ def _resolve_lid_phone_jids(chats: list[tuple], senders: tuple[str, ...] | list[
         )
         try:
             with urlopen(request, timeout=1) as response:
-                resolved.update(json.load(response))
+                result = json.load(response)
+            for lid, phone in result.items():
+                if lid in batch and isinstance(phone, str) and phone.endswith("@s.whatsapp.net"):
+                    with ARCHIVE_LOCK:
+                        ingest_whatsapp_event(
+                            {"type": "contact_mapping", "lid": lid, "phoneJid": phone}, SessionFactory, MEDIA_DIR
+                        )
+                    resolved[lid] = phone
         except (OSError, ValueError):
+            logger.warning("Contact resolution unavailable; using archived mappings", exc_info=True)
             continue
     return {
         lid: phone
@@ -380,7 +577,7 @@ def _chat_view_names(chats: list[tuple], lid_phone_jids: dict[str, str]) -> tupl
     return display_names, hidden_chat_ids
 
 
-def _page(query: str, selected_chat: int | None) -> str:
+def _page(query: str, selected_chat: int | None, before: int | None = None) -> str:
     whatsapp_status = _whatsapp_status()
     state_labels = {
         "bridge_unavailable": "Bridge nicht erreichbar",
@@ -419,6 +616,7 @@ def _page(query: str, selected_chat: int | None) -> str:
         else '<small id="connection-error" class="connection-error" hidden></small>'
     )
     with SessionFactory() as session:
+        aliases = dict(session.execute(select(Chat.id, Chat.alias).where(Chat.alias.is_not(None))).all())
         chats = session.execute(
             select(
                 Chat.id,
@@ -428,9 +626,7 @@ def _page(query: str, selected_chat: int | None) -> str:
                 func.max(case((_chat_activity_predicate(), Message.sent_at), else_=None)),
             )
             .outerjoin(Message, Message.chat_id == Chat.id)
-            .where(or_(Message.id.is_(None), Message.text != "[protocolMessage]"))
-            .where(or_(Message.raw_data.is_(None), ~Message.raw_data.contains('"reactionMessage"')))
-            .where(or_(Message.raw_data.is_(None), ~Message.raw_data.contains('"secretEncryptedMessage"')))
+            .where(or_(Message.id.is_(None), _visible_archived_message()))
             .group_by(Chat.id, Chat.title, Chat.identity_key)
             .order_by(Chat.title.collate("NOCASE"))
         ).all()
@@ -460,20 +656,35 @@ def _page(query: str, selected_chat: int | None) -> str:
         statement = (
             select(Message, Chat.title)
             .join(Chat, Chat.id == Message.chat_id)
-            .where(Message.text != "[protocolMessage]")
-            .where(or_(Message.raw_data.is_(None), ~Message.raw_data.contains('"reactionMessage"')))
-            .where(or_(Message.raw_data.is_(None), ~Message.raw_data.contains('"secretEncryptedMessage"')))
+            .where(_visible_archived_message())
         )
         if selected_chat is not None:
             statement = statement.where(Message.chat_id == selected_chat)
         if query:
             pattern = f"%{query}%"
-            statement = statement.where(or_(Message.text.ilike(pattern), Message.sender.ilike(pattern)))
-        messages = session.execute(statement.order_by(Message.sent_at.desc(), Message.id.desc()).limit(100)).all()
+            prior_match = select(MessageVersion.id).where(
+                MessageVersion.message_id == Message.id,
+                or_(MessageVersion.text.ilike(pattern), MessageVersion.sender.ilike(pattern)),
+            ).exists()
+            statement = statement.where(or_(Message.text.ilike(pattern), Message.sender.ilike(pattern), prior_match))
+        if before is not None:
+            anchor = session.get(Message, before)
+            if anchor is None or (selected_chat is not None and anchor.chat_id != selected_chat):
+                raise HTTPException(status_code=404, detail="Pagination message not found")
+            statement = statement.where(or_(
+                Message.sent_at < anchor.sent_at,
+                and_(Message.sent_at == anchor.sent_at, Message.id < anchor.id),
+            ))
+        message_rows = session.execute(
+            statement.order_by(Message.sent_at.desc(), Message.id.desc()).limit(101)
+        ).all()
+        has_older = len(message_rows) > 100
+        messages = message_rows[:100]
         message_ids = [message.id for message, _chat_title in messages]
         media_rows = (
             session.scalars(select(Media).where(Media.message_id.in_(message_ids))).all() if message_ids else []
         )
+        media_ids_by_hash = dict(session.execute(select(Media.sha256, Media.id)).all())
         version_rows = (
             session.scalars(select(MessageVersion).where(MessageVersion.message_id.in_(message_ids))).all()
             if message_ids
@@ -486,8 +697,20 @@ def _page(query: str, selected_chat: int | None) -> str:
         for version in version_rows:
             versions_by_message.setdefault(version.message_id, []).append(version)
 
-    lid_phone_jids = _resolve_lid_phone_jids(chats, tuple(message.sender for message, _title in messages if message.sender))
+    archived_senders = {message.id: _archived_sender(message) for message, _title in messages}
+    lid_phone_jids = _resolve_lid_phone_jids(
+        chats, tuple(sender for sender in archived_senders.values() if sender)
+    )
     resolved_chat_names, hidden_chat_ids = _chat_view_names(chats, lid_phone_jids)
+    contact_by_identity = {identity_key: chat_id for chat_id, _title, identity_key, *_rest in chats}
+    for chat_id, title, _identity, *_rest in chats:
+        phone = lid_phone_jids.get(title)
+        phone_id = contact_by_identity.get(hashlib.sha256(phone.encode("utf-8")).hexdigest()) if phone else None
+        if chat_id in aliases:
+            resolved_chat_names[chat_id] = aliases[chat_id]
+            hidden_chat_ids.discard(chat_id)
+        elif phone_id in aliases:
+            resolved_chat_names[chat_id] = aliases[phone_id]
     visible_chats = [chat for chat in chats if chat[0] not in hidden_chat_ids]
     display_name_by_chat_id = {
         chat_id: resolved_chat_names.get(chat_id, _display_chat_name(chat_id, title))
@@ -506,7 +729,19 @@ def _page(query: str, selected_chat: int | None) -> str:
         for chat_id, title, _identity_key, _message_count, _last_message_at in chats
     }
     contact_by_identity = {identity_key: (chat_id, title) for chat_id, title, identity_key, *_rest in chats}
+    for sender in archived_senders.values():
+        if sender:
+            identity = hashlib.sha256(sender.strip().casefold().encode("utf-8")).hexdigest()
+            contact = contact_by_identity.get(identity)
+            if contact is not None:
+                contact_id, _contact_title = contact
+                display_name_by_jid[sender] = chat_display_name_by_id[contact_id]
     for lid, phone in lid_phone_jids.items():
+        lid_identity = hashlib.sha256(lid.strip().casefold().encode("utf-8")).hexdigest()
+        lid_contact = contact_by_identity.get(lid_identity)
+        if lid_contact is not None and lid_contact[0] in aliases:
+            display_name_by_jid[lid] = aliases[lid_contact[0]]
+            continue
         phone_identity = hashlib.sha256(phone.strip().casefold().encode("utf-8")).hexdigest()
         contact = contact_by_identity.get(phone_identity)
         if contact is None:
@@ -532,17 +767,36 @@ def _page(query: str, selected_chat: int | None) -> str:
 
     message_html: list[str] = []
     for message, chat_title in messages:
-        media_html = "".join(_render_media(item, message) for item in media_by_message.get(message.id, []))
-        if not media_html and message.deleted_at is None and message.raw_data:
+        status_context_html, status_media_hash = _status_reply_context(message.raw_data, media_ids_by_hash)
+        media_html = "".join(
+            _render_media(item, message) for item in media_by_message.get(message.id, [])
+            if item.sha256 != status_media_hash
+        )
+        if message.deleted_at is None and message.raw_data:
             try:
-                raw_content = json.loads(message.raw_data).get("message") or {}
+                raw_content = json.loads(message.raw_data)
             except (TypeError, ValueError):
                 raw_content = {}
-            if isinstance(raw_content, dict) and "videoMessage" in raw_content:
-                media_html = (
-                    f'<button class="media-retry" type="button" data-message-id="{message.id}">Video erneut laden</button>'
-                    f'<small class="media-retry-status" id="media-retry-{message.id}" hidden></small>'
+            kind = media_kind(raw_content) if isinstance(raw_content, dict) else None
+            content = media_content(raw_content) if isinstance(raw_content, dict) else None
+            if kind and content is not None:
+                item = content[kind]
+                encoded_hash = item.get("fileSha256") or item.get("thumbnailSha256")
+                expected_hash = None
+                if encoded_hash:
+                    try:
+                        expected_hash = base64.b64decode(encoded_hash, validate=True).hex()
+                    except (TypeError, ValueError):
+                        logger.warning("Invalid archived media checksum for message %s", message.id)
+                primary_available = any(
+                    expected_hash is None or media.sha256 == expected_hash
+                    for media in media_by_message.get(message.id, [])
                 )
+                if not primary_available:
+                    media_html += (
+                        f'<button class="media-retry" type="button" data-message-id="{message.id}">{MEDIA_LABELS[kind]} erneut laden</button>'
+                        f'<small class="media-retry-status" id="media-retry-{message.id}" hidden></small>'
+                    )
         reactions = reactions_by_message.get(message.id, [])
         reaction_html = (
             '<div class="message-reactions">{}</div>'.format(
@@ -551,7 +805,7 @@ def _page(query: str, selected_chat: int | None) -> str:
             if reactions
             else ""
         )
-        sender_key = message.sender or chat_display_name_by_id.get(message.chat_id, chat_title)
+        sender_key = archived_senders[message.id] or chat_display_name_by_id.get(message.chat_id, chat_title)
         sender = display_name_by_jid.get(sender_key, _display_chat_name(message.chat_id, sender_key))
         previous = versions_by_message.get(message.id, [])
         versions_html = ""
@@ -566,7 +820,7 @@ def _page(query: str, selected_chat: int | None) -> str:
             utc_attribute = f' data-utc="{utc_value}"'
         message_html.append(
             '<article id="message-{message_id}" class="message{message_class}" data-open-chat="{open_chat}" data-chat-id="{chat_id}" data-message-id="{message_id}"{tabindex}><div class="message-meta"><strong>{sender}</strong><time{utc_attribute}>{time}</time></div>'
-            '<p>{text}</p>{reactions}{media}{deleted}{versions}</article>'.format(
+            '<p>{text}</p>{status_context}{reactions}{media}{deleted}{versions}</article>'.format(
                 message_id=message.id,
                 message_class=" message-link" if selected_chat is None else "",
                 open_chat="true" if selected_chat is None else "false",
@@ -576,6 +830,7 @@ def _page(query: str, selected_chat: int | None) -> str:
                 time=message.sent_at.strftime("%d.%m.%Y %H:%M"),
                 utc_attribute=utc_attribute,
                 text=html.escape(_display_message_text(message)),
+                status_context=status_context_html,
                 reactions=reaction_html,
                 media=media_html,
                 deleted=deleted_html,
@@ -608,6 +863,26 @@ def _page(query: str, selected_chat: int | None) -> str:
     conversation_class = ""
     conversation_back = ""
     search_action = f"/chats/{selected_chat}" if selected_chat is not None else "/"
+    navigation = []
+    if has_older:
+        parameters = {"q": query, "before": messages[-1][0].id}
+        if selected_chat is not None:
+            parameters["chat"] = selected_chat
+        navigation.append(
+            f'<a href="{html.escape(search_action + "?" + urlencode(parameters), quote=True)}">Ältere Nachrichten</a>'
+        )
+    if before is not None:
+        navigation.append(
+            f'<a href="{html.escape(search_action + "?" + urlencode({"q": query}), quote=True)}">Neueste Nachrichten</a>'
+        )
+    pagination = '<nav class="pagination">' + " · ".join(navigation) + "</nav>" if navigation else ""
+    protection = whatsapp_status.get("archive_protection", {})
+    latest_snapshot = protection.get("last_snapshot")
+    protection_label = (
+        "Letzte geprüfte Sicherung: " + latest_snapshot["created_at"]
+        if latest_snapshot else "Noch keine geprüfte Sicherung."
+    )
+    protection_label = protection.get("error") or protection_label
 
     return f"""<!doctype html>
 <html lang="de">
@@ -628,13 +903,13 @@ def _page(query: str, selected_chat: int | None) -> str:
     input, button {{ min-height: 42px; border: 1px solid var(--line); border-radius: 4px; background: var(--white); color: var(--ink); font: inherit; padding: 8px 10px; }}
     button {{ padding: 8px 16px; background: var(--green); border-color: var(--green); color: var(--white); cursor: pointer; font-weight: 600; }}
     button:hover {{ background: #0e543f; }}
-    .layout {{ display: grid; grid-template-columns: minmax(220px, 290px) minmax(0, 1fr); gap: 32px; padding-top: 26px; }}
+    .layout {{ display: grid; grid-template-columns: minmax(220px, 290px) minmax(0, 1fr); align-items: start; gap: 32px; padding-top: 26px; }}
     .conversation-layout {{ grid-template-columns: minmax(0, 1fr); }}
-    aside {{ border-right: 1px solid var(--line); padding-right: 22px; }}
+    aside {{ position: sticky; top: 12px; display: flex; flex-direction: column; max-height: calc(100vh - 24px); min-height: 0; border-right: 1px solid var(--line); padding-right: 22px; }}
     .chat-sidebar-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; }}
     .chat-sidebar-heading h2 {{ margin: 0; }}
     .chat-sidebar-heading button {{ min-height: 32px; padding: 4px 8px; font-size: 11px; }}
-    .chat-list {{ display: grid; gap: 3px; }}
+    .chat-list {{ display: grid; align-content: start; gap: 3px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }}
     .chat-link {{ display: flex; justify-content: space-between; align-items: baseline; gap: 10px; min-width: 0; padding: 11px 10px; border-radius: 3px; color: var(--ink); text-decoration: none; }}
     .chat-link span {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .chat-link small, .chat-link.selected small {{ color: var(--muted); }}
@@ -656,6 +931,11 @@ def _page(query: str, selected_chat: int | None) -> str:
     .message-meta {{ display: flex; justify-content: space-between; gap: 16px; font-size: 13px; }}
     .message-meta time {{ color: var(--muted); white-space: nowrap; }}
     .message p {{ margin: 8px 0 0; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }}
+    .status-reply {{ margin: 10px 0 0; padding: 10px 12px; border-left: 3px solid var(--green); background: var(--green-soft); }}
+    .status-reply strong {{ font-size: 12px; color: var(--green); }}
+    .status-reply p {{ margin-top: 5px; color: var(--muted); font-size: 13px; }}
+    .status-reply-media {{ display: block; width: fit-content; margin-top: 8px; }}
+    .status-reply-media img {{ display: block; max-width: min(100%, 360px); max-height: 240px; border-radius: 4px; }}
     .message-reactions {{ display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }}
     .reaction {{ display: inline-flex; align-items: center; min-height: 24px; padding: 2px 7px; border: 1px solid var(--line); border-radius: 999px; background: var(--white); font-size: 14px; }}
     .message-reactions {{ display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }}
@@ -678,7 +958,7 @@ def _page(query: str, selected_chat: int | None) -> str:
     .versions summary {{ cursor: pointer; }}
     .versions p {{ border-left: 2px solid var(--line); padding-left: 9px; }}
     .empty {{ color: var(--muted); font-size: 13px; }}
-    @media (max-width: 760px) {{ .connection {{ align-items: flex-start; flex-direction: column; gap: 10px; }} .connection-copy {{ min-width: 0; }} .pairing {{ align-items: flex-start; }} .layout {{ grid-template-columns: 1fr; gap: 22px; }} aside {{ border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 18px; }} .chat-list {{ display: flex; overflow-x: auto; padding-bottom: 4px; }} .chat-link {{ flex: 0 0 auto; max-width: 220px; }} .feed-head {{ align-items: flex-start; flex-direction: column; }} .search {{ width: 100%; }} }}
+    @media (max-width: 760px) {{ .connection {{ align-items: flex-start; flex-direction: column; gap: 10px; }} .connection-copy {{ min-width: 0; }} .pairing {{ align-items: flex-start; }} .layout {{ grid-template-columns: 1fr; gap: 22px; }} aside {{ position: static; display: block; max-height: none; border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 18px; }} .chat-list {{ display: flex; overflow-x: auto; overflow-y: hidden; padding-bottom: 4px; }} .chat-link {{ flex: 0 0 auto; max-width: 220px; }} .feed-head {{ align-items: flex-start; flex-direction: column; }} .search {{ width: 100%; }} }}
   </style>
 </head>
 <body>
@@ -687,6 +967,12 @@ def _page(query: str, selected_chat: int | None) -> str:
         <section class="connection" aria-live="polite">
             <div class="connection-copy"><p class="connection-state" id="connection-state">{state_label}</p><small class="connection-counts" id="connection-counts">{archive_counts}</small>{bridge_error_html}</div>
             <div id="pairing-area">{qr_panel}</div>
+        </section>
+        <section aria-live="polite">
+            <button type="button" id="archive-snapshot">Archiv absichern</button>
+            <small id="archive-protection">{html.escape(protection_label)}</small>
+            <p class="connection-counts">Sicherungen unter backups separat auf ein anderes Laufwerk kopieren.
+            Eine lokale Sicherung schützt nicht vor Laufwerksausfall.</p>
         </section>
         <div class="layout{conversation_class}">
             {chat_sidebar}
@@ -697,10 +983,35 @@ def _page(query: str, selected_chat: int | None) -> str:
                     {'' if selected_chat is not None else clear_filter}
         </div>
         <div class="feed">{''.join(message_html)}</div>
+        {pagination}
       </section>
     </div>
   </main>
     <script>
+        const chatListScrollKey = 'whatsapp-archive-chat-list-scroll';
+        try {{
+            const savedChatListScroll = JSON.parse(sessionStorage.getItem(chatListScrollKey) || 'null');
+            if (savedChatListScroll) {{
+                sessionStorage.removeItem(chatListScrollKey);
+                requestAnimationFrame(() => {{
+                    const chatList = document.querySelector('.chat-list');
+                    if (chatList) {{
+                        chatList.scrollTop = savedChatListScroll.scrollTop || 0;
+                        chatList.scrollLeft = savedChatListScroll.scrollLeft || 0;
+                    }}
+                }});
+            }}
+        }} catch {{ }}
+        document.addEventListener('click', (event) => {{
+            if (!event.target.closest('.chat-link')) return;
+            const chatList = document.querySelector('.chat-list');
+            try {{
+                sessionStorage.setItem(chatListScrollKey, JSON.stringify({{
+                    scrollTop: chatList?.scrollTop || 0,
+                    scrollLeft: chatList?.scrollLeft || 0,
+                }}));
+            }} catch {{ }}
+        }});
         document.addEventListener('click', (event) => {{
             const target = event.target.closest('.message');
             if (!target || target.dataset.openChat !== 'true') return;
@@ -732,14 +1043,34 @@ def _page(query: str, selected_chat: int | None) -> str:
         const renderedLiveRevision = Number({whatsapp_status.get('live_revision', 0)});
         let previousLiveRevision = null;
         let stableLiveRevisionPolls = 0;
+        let archiveActionInProgress = false;
+        let archiveActionError = null;
+        let aliasSubmitting = false;
+        document.querySelector('.contact-name-form')?.addEventListener('submit', () => {{
+            aliasSubmitting = true;
+        }});
+        function aliasEditInProgress() {{
+            const input = document.querySelector('.contact-name-form input');
+            return aliasSubmitting || (input && (
+                input.value !== input.defaultValue ||
+                input.closest('form').contains(document.activeElement)
+            ));
+        }}
         async function refreshWhatsAppStatus() {{
             try {{
                 const response = await fetch('/api/whatsapp/status', {{ cache: 'no-store' }});
                 if (!response.ok) return;
                 const state = await response.json();
+                const protection = state.archive_protection || {{}};
+                const snapshot = protection.last_snapshot;
+                if (!archiveActionInProgress) {{
+                    document.getElementById('archive-protection').textContent = archiveActionError || protection.error ||
+                        (snapshot ? `Letzte geprüfte Sicherung: ${{snapshot.created_at}}` : 'Noch keine geprüfte Sicherung.');
+                }}
                 const labels = {{ bridge_unavailable: 'Bridge nicht erreichbar', starting: 'Verbindung startet', pairing_required: 'QR-Kopplung erforderlich', connected: 'Verbunden', syncing_history: 'Chatverlauf wird synchronisiert', reconnecting: 'Verbindung wird wiederhergestellt', logged_out: 'Abgemeldet', error: 'Verbindungsfehler', mock: 'Testmodus' }};
                 document.getElementById('connection-state').textContent = labels[state.state] || 'Unbekannter Status';
-                document.getElementById('connection-counts').textContent = `${{state.archived_chats}} Chats · ${{state.archived_messages}} Nachrichten im Archiv`;
+                document.getElementById('connection-counts').textContent = `${{state.archived_chats}} Chats · ${{state.archived_messages}} Nachrichten im Archiv` +
+                    (protection.pending_events ? ` · ${{protection.pending_events}} ausstehende Ereignisse` : '');
                 const liveRevision = Number(state.live_revision || 0);
                 const changedSinceRender = liveRevision !== renderedLiveRevision;
                 if (changedSinceRender && liveRevision === previousLiveRevision) {{
@@ -748,7 +1079,7 @@ def _page(query: str, selected_chat: int | None) -> str:
                     stableLiveRevisionPolls = changedSinceRender ? 1 : 0;
                 }}
                 previousLiveRevision = liveRevision;
-                if (stableLiveRevisionPolls >= 2 && !['starting', 'syncing_history', 'reconnecting'].includes(state.state)) {{
+                if (!archiveActionInProgress && !aliasEditInProgress() && {'false' if before is not None else 'true'} && stableLiveRevisionPolls >= 2 && !['starting', 'syncing_history', 'reconnecting'].includes(state.state)) {{
                     window.location.reload();
                     return;
                 }}
@@ -756,6 +1087,7 @@ def _page(query: str, selected_chat: int | None) -> str:
                 error.textContent = state.lastError || '';
                 error.hidden = !state.lastError;
                 const area = document.getElementById('pairing-area');
+                if (archiveActionInProgress) return;
                 if (state.qrDataUrl) {{
                     area.innerHTML = '<div class="pairing"><img alt="WhatsApp-Verknüpfungs-QR-Code"><span>In WhatsApp unter Verknüpfte Geräte scannen. Den Code nicht weitergeben.</span></div>';
                     area.querySelector('img').src = state.qrDataUrl;
@@ -768,32 +1100,63 @@ def _page(query: str, selected_chat: int | None) -> str:
             const button = event.target.closest('.media-retry');
             if (!button || button.disabled) return;
             const status = document.getElementById(`media-retry-${{button.dataset.messageId}}`);
+            const originalLabel = button.textContent;
             button.disabled = true;
-            button.textContent = 'Video wird geladen …';
+            button.textContent = 'Medium wird geladen …';
             try {{
                 const response = await fetch(`/api/media/${{button.dataset.messageId}}/retry`, {{ method: 'POST' }});
-                if (!response.ok) throw new Error('Video retry failed');
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.detail || result.error || 'Medium konnte nicht geladen werden');
                 window.location.reload();
-            }} catch {{
+            }} catch (error) {{
                 button.disabled = false;
-                button.textContent = 'Video erneut laden';
-                status.textContent = 'Video konnte nicht geladen werden. Bitte später erneut versuchen.';
+                button.textContent = originalLabel;
+                status.textContent = error.message;
                 status.hidden = false;
             }}
         }});
         document.addEventListener('click', async (event) => {{
+            const button = event.target.closest('#archive-snapshot');
+            if (!button || button.disabled || archiveActionInProgress) return;
+            archiveActionInProgress = true;
+            archiveActionError = null;
+            button.disabled = true;
+            const status = document.getElementById('archive-protection');
+            status.textContent = 'Archiv wird gesichert und geprüft …';
+            try {{
+                const response = await fetch('/api/archive/snapshot', {{ method: 'POST' }});
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.detail || 'Sicherung fehlgeschlagen');
+                status.textContent = `Geprüfte Sicherung: ${{result.snapshot}}. Separat auf ein anderes Laufwerk kopieren.`;
+            }} catch (error) {{
+                archiveActionError = error.message;
+                status.textContent = error.message;
+            }} finally {{
+                archiveActionInProgress = false;
+                button.disabled = false;
+            }}
+        }});
+        document.addEventListener('click', async (event) => {{
             const button = event.target.closest('#pairing-reset');
-            if (!button) return;
-            if (!window.confirm('Die lokale WhatsApp-Sitzung wird entfernt. Danach wird ein neuer QR-Code angefordert. Fortfahren?')) return;
+            if (!button || button.disabled || archiveActionInProgress) return;
+            if (!window.confirm('Zuerst wird das Archiv gesichert und geprüft. Nur bei Erfolg wird die lokale WhatsApp-Sitzung entfernt und ein neuer QR-Code angefordert. Fortfahren?')) return;
+            archiveActionInProgress = true;
+            archiveActionError = null;
             button.disabled = true;
             button.textContent = 'Kopplung wird vorbereitet …';
             try {{
                 const response = await fetch('/api/whatsapp/pairing/reset', {{ method: 'POST' }});
-                if (!response.ok) throw new Error('Pairing reset failed');
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.detail || result.error || 'Neukopplung fehlgeschlagen');
+                archiveActionInProgress = false;
                 await refreshWhatsAppStatus();
-            }} catch {{
+            }} catch (error) {{
                 button.disabled = false;
                 button.textContent = 'Neue lokale Kopplung';
+                archiveActionError = error.message;
+                document.getElementById('archive-protection').textContent = error.message;
+            }} finally {{
+                archiveActionInProgress = false;
             }}
         }});
         window.setInterval(refreshWhatsAppStatus, 2500);
@@ -806,6 +1169,7 @@ def _page(query: str, selected_chat: int | None) -> str:
 def index(
     q: str = Query(default="", max_length=200),
     chat: int | None = Query(default=None),
+    before: Annotated[int | None, Query(ge=1)] = None,
 ) -> HTMLResponse:
     if chat is None:
         with SessionFactory() as session:
@@ -817,18 +1181,21 @@ def index(
                 .limit(1)
             )
     return HTMLResponse(
-        _page(q, chat),
+        _page(q, chat, before),
         headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"},
     )
 
 
 @app.get("/chats/{chat_id}", response_class=HTMLResponse)
-def chat_view(chat_id: int, q: str = Query(default="", max_length=200)) -> HTMLResponse:
+def chat_view(
+    chat_id: int, q: str = Query(default="", max_length=200),
+    before: Annotated[int | None, Query(ge=1)] = None,
+) -> HTMLResponse:
     with SessionFactory() as session:
         if session.get(Chat, chat_id) is None:
             raise HTTPException(status_code=404, detail="Chat not found")
     return HTMLResponse(
-        _page(q, chat_id),
+        _page(q, chat_id, before),
         headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"},
     )
 
@@ -841,11 +1208,12 @@ def rename_chat(chat_id: int, request: FastAPIRequest, name: str = Form(..., max
     title = name.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Contact name is required")
-    with SessionFactory.begin() as session:
-        chat = session.get(Chat, chat_id)
-        if chat is None:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        chat.title = title
+    with ARCHIVE_LOCK:
+        with SessionFactory.begin() as session:
+            chat = session.get(Chat, chat_id)
+            if chat is None:
+                raise HTTPException(status_code=404, detail="Chat not found")
+            chat.alias = title
     return RedirectResponse(f"/chats/{chat_id}", status_code=303)
 
 
