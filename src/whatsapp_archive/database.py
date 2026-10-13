@@ -33,13 +33,5 @@ def create_database(database_url: str | None = None):
                 ):
                     if name not in columns:
                         connection.exec_driver_sql(f"ALTER TABLE messages ADD COLUMN {name} {sql_type}")
-            if "chats" in tables:
-                columns = {column["name"] for column in inspect(connection).get_columns("chats")}
-                if "is_archived" not in columns:
-                    connection.exec_driver_sql("ALTER TABLE chats ADD COLUMN is_archived BOOLEAN")
-            if "chats" in tables:
-                columns = {column["name"] for column in inspect(connection).get_columns("chats")}
-                if "is_archived" not in columns:
-                    connection.exec_driver_sql("ALTER TABLE chats ADD COLUMN is_archived BOOLEAN")
     Base.metadata.create_all(engine)
     return engine, sessionmaker(bind=engine, expire_on_commit=False)

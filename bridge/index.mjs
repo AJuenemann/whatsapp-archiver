@@ -6,6 +6,7 @@ import path from 'node:path'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import makeWASocket, {
+  BufferJSON,
   Browsers,
   DisconnectReason,
   downloadMediaMessage,
@@ -23,6 +24,7 @@ const authRoot = path.join(dataRoot, 'whatsapp-auth')
 const eventRoot = path.join(dataRoot, 'whatsapp-events')
 const mediaRoot = path.join(dataRoot, 'media', 'whatsapp')
 const port = Number(process.env.BRIDGE_PORT || 8765)
+const maxRetryMediaRequestBytes = 2 * 1024 * 1024
 const testMode = process.env.WHATSAPP_BRIDGE_MODE === 'mock'
 const logger = pino({ level: 'silent' })
 const chatNames = new Map()
@@ -39,7 +41,6 @@ const status = {
 }
 let reconnectScheduled = false
 let resetInProgress = false
-let contactsRefreshInProgress = false
 let activeSocket = null
 
 await Promise.all([secureDirectory(authRoot), secureDirectory(eventRoot), secureDirectory(mediaRoot)])
@@ -73,7 +74,7 @@ async function saveLidMappings(mappings = []) {
 }
 
 async function saveContact(contact) {
-  const name = contact.name || contact.notify || contact.verifiedName || contact.pushName
+  const name = contact.name || contact.notify || contact.username || contact.verifiedName || contact.pushName
   if (!name || isRawJid(name)) return
   const identifiers = new Set([contact.id, contact.lid, contact.phoneNumber].filter(Boolean))
   const updates = new Set()
@@ -168,7 +169,10 @@ async function saveMedia(message) {
   const digest = createHash('sha256')
   let size = 0
   try {
-    const stream = await downloadMediaMessage(message, 'stream', {}, { logger, reuploadRequest: undefined })
+    const stream = await downloadMediaMessage(message, 'stream', {}, {
+      logger,
+      reuploadRequest: (failedMessage) => activeSocket.updateMediaMessage(failedMessage),
+    })
     await pipeline(
       stream,
       new Transform({
@@ -214,17 +218,16 @@ async function saveMedia(message) {
 async function saveChat(chat) {
   if (!chat?.id || chat.id === 'status@broadcast' || chat.id.endsWith('@broadcast')) return
   knownChatIds.add(chat.id)
-  const candidate = chat.name || chat.subject || chat.notify || chat.verifiedName || chat.pushName
+  const candidate = chat.name || chat.subject || chat.notify || chat.username || chat.verifiedName || chat.pushName
   const mappedPhone = lidToPhone.get(chat.id)
   const title = candidate && !isRawJid(candidate)
     ? candidate
     : chatNames.get(chat.id) || chatNames.get(mappedPhone) || chat.id
   if (!isRawJid(title)) chatNames.set(chat.id, title)
-  const isArchived = typeof chat.archive === 'boolean' ? chat.archive : null
-  await writeEvent({ type: 'chat', jid: chat.id, title, isArchived })
+  await writeEvent({ type: 'chat', jid: chat.id, title })
   for (const lid of phoneToLids.get(chat.id) || []) {
     chatNames.set(lid, title)
-    await writeEvent({ type: 'chat', jid: lid, title, isArchived })
+    await writeEvent({ type: 'chat', jid: lid, title })
   }
   status.history.chats = chatNames.size
 }
@@ -279,6 +282,7 @@ async function saveMessage(message) {
     rawData: message,
   })
   status.history.messages += 1
+  return { media, mediaError }
 }
 
 export async function startWhatsApp() {
@@ -337,14 +341,6 @@ export async function startWhatsApp() {
 
   socket.ev.on('chats.upsert', async (chats) => {
     for (const chat of chats) await saveChat(chat)
-  })
-
-  socket.ev.on('chats.update', async (updates) => {
-    for (const update of updates) {
-      const archive = typeof update.archive === 'boolean' ? update.archive : update.archived
-      if (typeof archive !== 'boolean') continue
-      await saveChat({ id: update.id, name: chatNames.get(update.id), archive })
-    }
   })
 
   socket.ev.on('contacts.upsert', async (contacts) => {
@@ -407,44 +403,61 @@ async function resolveLidPhones(jids) {
   return resolved
 }
 
-async function refreshContacts() {
-  if (!activeSocket || !authKeys || !status.paired || status.state === 'syncing_history') {
-    const error = new Error('Contacts can only be refreshed while connected and idle')
+const mediaRetriesInProgress = new Set()
+
+async function retryVideo(message) {
+  const jid = message.key?.remoteJid || message.key?.remoteJidAlt
+  const id = message.key?.id
+  if (!activeSocket || !status.paired || !jid || !id || getContentType(normalizeMessageContent(message.message)) !== 'videoMessage') {
+    const error = new Error('A connected session and a stored video message are required')
+    error.statusCode = 400
+    throw error
+  }
+  const retryKey = `${jid}:${id}`
+  if (mediaRetriesInProgress.has(retryKey)) {
+    const error = new Error('This video is already being downloaded')
     error.statusCode = 409
     throw error
   }
-  if (contactsRefreshInProgress) {
-    const error = new Error('Contact refresh is already in progress')
-    error.statusCode = 409
-    throw error
-  }
-  contactsRefreshInProgress = true
+  mediaRetriesInProgress.add(retryKey)
   try {
-    await authKeys.set({ 'app-state-sync-version': { regular_low: null } })
-    await activeSocket.resyncAppState(['regular_low'], true)
-    await activeSocket.resyncAppState(['regular'], false)
-    const versions = await authKeys.get('app-state-sync-version', ['regular_low'])
-    if (!versions.regular_low) {
-      const error = new Error('WhatsApp did not return the chat app-state snapshot')
+    const refreshedMessage = await activeSocket.updateMediaMessage(message)
+    const result = await saveMessage(refreshedMessage)
+    if (!result?.media) {
+      const error = new Error(result?.mediaError || 'MediaDownloadError')
       error.statusCode = 503
       throw error
     }
-    return { state: 'contacts_refreshed' }
+    return { state: 'media_retried' }
   } finally {
-    contactsRefreshInProgress = false
+    mediaRetriesInProgress.delete(retryKey)
   }
 }
 
 const server = createServer(async (request, response) => {
   const pathname = new URL(request.url, 'http://localhost').pathname
-  if (request.method === 'POST' && pathname === '/contacts/refresh') {
-    refreshContacts().then((result) => {
+  if (request.method === 'POST' && pathname === '/media/retry') {
+    try {
+      const chunks = []
+      let size = 0
+      for await (const chunk of request) {
+        size += chunk.length
+        if (size > maxRetryMediaRequestBytes) {
+          response.writeHead(413).end()
+          return
+        }
+        chunks.push(chunk)
+      }
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'), BufferJSON.reviver)
+      const message = proto.WebMessageInfo.fromObject(body.message)
+      const result = await retryVideo(message)
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
       response.end(JSON.stringify(result))
-    }).catch((error) => {
-      response.writeHead(error.statusCode || 500, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-      response.end(JSON.stringify({ error: error.statusCode ? error.message : 'Contact refresh failed' }))
-    })
+    } catch (error) {
+      const statusCode = error.statusCode || 400
+      response.writeHead(statusCode, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+      response.end(JSON.stringify({ error: statusCode === 503 ? 'Video could not be downloaded' : error.message }))
+    }
     return
   }
   if (request.method === 'POST' && pathname === '/resolve-lids') {

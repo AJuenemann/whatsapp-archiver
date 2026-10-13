@@ -40,9 +40,7 @@ services:
     environment:
       DATA_DIR: /data
       DATABASE_URL: sqlite:////data/archive.db
-      INCOMING_DIR: /data/incoming
       MEDIA_DIR: /data/media
-      TMPDIR: /data/tmp
       WHATSAPP_BRIDGE_URL: http://whatsapp-bridge:8765
     ports:
       - "127.0.0.1:${VIEWER_PORT:-8000}:8000"

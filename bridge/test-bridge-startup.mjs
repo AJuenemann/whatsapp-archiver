@@ -30,7 +30,8 @@ test('bridge preserves plain conversation text and skips other protocol messages
 
 test('contact updates accept Baileys display-name alternatives', async () => {
   const source = await readFile(new URL('./index.mjs', import.meta.url), 'utf8')
-  assert.match(source, /contact\.name \|\| contact\.notify \|\| contact\.verifiedName \|\| contact\.pushName/)
+  assert.match(source, /contact\.name \|\| contact\.notify \|\| contact\.username \|\| contact\.verifiedName \|\| contact\.pushName/)
+  assert.match(source, /chat\.notify \|\| chat\.username \|\| chat\.verifiedName/)
   assert.match(source, /if \(!isRawJid\(title\)\) chatNames\.set\(chat\.id, title\)/)
   assert.match(source, /lidPnMappings = \[\]/)
   assert.match(source, /await saveLidMappings\(lidPnMappings\)/)
@@ -46,13 +47,12 @@ test('LID resolution reads only stored reverse mappings in bounded batches', asy
   assert.match(source, /response\.writeHead\(413\)/)
 })
 
-test('manual refresh loads a regular_low archive snapshot and regular contact changes', async () => {
+test('stored videos can be retried through a bounded reupload-aware endpoint', async () => {
   const source = await readFile(new URL('./index.mjs', import.meta.url), 'utf8')
-  assert.match(source, /const archive = typeof update\.archive === 'boolean' \? update\.archive : update\.archived/)
-  assert.match(source, /authKeys\.set\(\{ 'app-state-sync-version': \{ regular_low: null \} \}\)/)
-  assert.match(source, /activeSocket\.resyncAppState\(\['regular_low'\], true\)/)
-  assert.match(source, /activeSocket\.resyncAppState\(\['regular'\], false\)/)
-  assert.match(source, /!versions\.regular_low/)
-  assert.match(source, /pathname === '\/contacts\/refresh'/)
-  assert.match(source, /status\.state === 'syncing_history'/)
+  assert.match(source, /reuploadRequest: \(failedMessage\) => activeSocket\.updateMediaMessage\(failedMessage\)/)
+  assert.match(source, /proto\.WebMessageInfo\.fromObject\(body\.message\)/)
+  assert.match(source, /const refreshedMessage = await activeSocket\.updateMediaMessage\(message\)/)
+  assert.match(source, /pathname === '\/media\/retry'/)
+  assert.match(source, /maxRetryMediaRequestBytes = 2 \* 1024 \* 1024/)
+  assert.match(source, /getContentType\(normalizeMessageContent\(message\.message\)\) !== 'videoMessage'/)
 })

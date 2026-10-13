@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import hashlib
+import html
 import json
 import logging
 import mimetypes
@@ -10,42 +10,33 @@ import os
 from datetime import timezone
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request as FastAPIRequest, UploadFile
+from fastapi import FastAPI, Form, HTTPException, Query
+from fastapi import Request as FastAPIRequest
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import and_, case, func, or_, select
 from starlette.concurrency import run_in_threadpool
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .database import create_database
-from .importer import (
-    MAX_IMPORT_BYTES,
-    import_export,
-    remember_upload,
-    save_upload,
-    scan_incoming,
-    scan_whatsapp_events,
-)
-from .models import Chat, ImportRecord, Media, Message, MessageVersion
+from .importer import scan_whatsapp_events
+from .models import Chat, Media, Message, MessageVersion
 
 logger = logging.getLogger("whatsapp_archive")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = Path(os.getenv("DATA_DIR", PROJECT_ROOT / "data"))
-INCOMING_DIR = Path(os.getenv("INCOMING_DIR", DATA_ROOT / "incoming"))
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", DATA_ROOT / "media"))
 WHATSAPP_EVENTS_DIR = Path(os.getenv("WHATSAPP_EVENTS_DIR", DATA_ROOT / "whatsapp-events"))
 WHATSAPP_BRIDGE_URL = os.getenv("WHATSAPP_BRIDGE_URL", "http://whatsapp-bridge:8765").rstrip("/")
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
-INCOMING_DIR.mkdir(parents=True, exist_ok=True)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 WHATSAPP_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
-TEMP_DIR = DATA_ROOT / "tmp"
-TEMP_DIR.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("TMPDIR", str(TEMP_DIR))
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_ROOT / 'archive.db'}")
 engine, SessionFactory = create_database(DATABASE_URL)
 app = FastAPI(title="WhatsApp Archive", docs_url=None, redoc_url=None)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
+_LIVE_REVISION = 0
 
 _INLINE_MEDIA_TYPES = {
     "image/jpeg",
@@ -88,61 +79,6 @@ _MESSAGE_STUB_LABELS = {
     "BIZ_PRIVACY_MODE_INIT_FB": "Unternehmenseinstellungen geändert",
     "GROUP_CHANGE_DESCRIPTION": "Gruppenbeschreibung geändert",
 }
-
-
-class _UploadBodyTooLarge(Exception):
-    pass
-
-
-class UploadSizeLimitMiddleware:
-    def __init__(self, app, limit: int):
-        self.app = app
-        self.limit = limit
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("method") != "POST" or scope.get("path") != "/imports":
-            await self.app(scope, receive, send)
-            return
-
-        headers = dict(scope.get("headers", []))
-        try:
-            content_length = int(headers.get(b"content-length", b"0"))
-        except ValueError:
-            content_length = 0
-        if content_length > self.limit:
-            await self._send_too_large(send)
-            return
-
-        received = 0
-
-        async def limited_receive():
-            nonlocal received
-            message = await receive()
-            if message["type"] == "http.request":
-                received += len(message.get("body", b""))
-                if received > self.limit:
-                    raise _UploadBodyTooLarge
-            return message
-
-        try:
-            await self.app(scope, limited_receive, send)
-        except _UploadBodyTooLarge:
-            await self._send_too_large(send)
-
-    async def _send_too_large(self, send) -> None:
-        body = b"Upload exceeds the 500 MiB request limit"
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 413,
-                "headers": [(b"content-type", b"text/plain; charset=utf-8"), (b"content-length", str(len(body)).encode())],
-            }
-        )
-        await send({"type": "http.response.body", "body": body})
-
-
-
-app.add_middleware(UploadSizeLimitMiddleware, limit=MAX_IMPORT_BYTES + 1024 * 1024)
 
 
 def _media_content_type(filename: str, raw_data: str | None = None) -> str:
@@ -204,20 +140,26 @@ def _render_media(media: Media, message: Message) -> str:
     return f'<div class="media-preview">{preview}<a class="attachment" href="{url}?download=1">Datei herunterladen: {label}</a></div>'
 
 
-async def _incoming_watcher() -> None:
+async def _live_event_watcher() -> None:
     while True:
-        await run_in_threadpool(scan_incoming, INCOMING_DIR, SessionFactory, MEDIA_DIR)
-        await run_in_threadpool(scan_whatsapp_events, WHATSAPP_EVENTS_DIR, SessionFactory, MEDIA_DIR)
+        await run_in_threadpool(_scan_live_events)
         await asyncio.sleep(4)
 
 
+def _scan_live_events() -> int:
+    global _LIVE_REVISION
+    processed = scan_whatsapp_events(WHATSAPP_EVENTS_DIR, SessionFactory, MEDIA_DIR)
+    _LIVE_REVISION += processed
+    return processed
+
+
 @app.on_event("startup")
-async def start_incoming_watcher() -> None:
-    app.state.watcher = asyncio.create_task(_incoming_watcher())
+async def start_live_event_watcher() -> None:
+    app.state.watcher = asyncio.create_task(_live_event_watcher())
 
 
 @app.on_event("shutdown")
-async def stop_incoming_watcher() -> None:
+async def stop_live_event_watcher() -> None:
     watcher = getattr(app.state, "watcher", None)
     if watcher is not None:
         watcher.cancel()
@@ -238,7 +180,7 @@ def _whatsapp_status() -> dict:
         request = Request(f"{WHATSAPP_BRIDGE_URL}/status", headers={"Accept": "application/json"})
         with urlopen(request, timeout=1) as response:
             status = json.load(response)
-    except Exception:
+    except (OSError, ValueError):
         status = {"state": "bridge_unavailable", "paired": False, "history": {}}
 
     with SessionFactory() as session:
@@ -246,6 +188,7 @@ def _whatsapp_status() -> dict:
         status["archived_messages"] = session.scalar(
             select(func.count(Message.id)).where(Message.source_key.is_not(None))
         ) or 0
+    status["live_revision"] = _LIVE_REVISION
     return status
 
 
@@ -278,30 +221,44 @@ def reset_whatsapp_pairing(request: FastAPIRequest) -> JSONResponse:
         raise HTTPException(status_code=503, detail="Could not start local pairing") from error
 
 
-@app.post("/api/whatsapp/contacts/refresh")
-def refresh_whatsapp_contacts(request: FastAPIRequest) -> JSONResponse:
+@app.post("/api/media/{message_id}/retry")
+def retry_video_media(message_id: int, request: FastAPIRequest) -> JSONResponse:
     origin = request.headers.get("origin")
     if origin is None or origin.rstrip("/") != str(request.base_url).rstrip("/"):
         raise HTTPException(status_code=403, detail="Same-origin request required")
+    with SessionFactory() as session:
+        message = session.get(Message, message_id)
+        if message is None or not message.raw_data:
+            raise HTTPException(status_code=404, detail="Video not found")
+        try:
+            raw_data = json.loads(message.raw_data)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail="Video data is invalid") from error
+        content = raw_data.get("message") if isinstance(raw_data, dict) else None
+        if not isinstance(content, dict) or "videoMessage" not in content:
+            raise HTTPException(status_code=400, detail="Message is not a video")
+        if session.scalar(select(Media.id).where(Media.message_id == message_id)) is not None:
+            return JSONResponse({"state": "already_available"})
+
     bridge_request = Request(
-        f"{WHATSAPP_BRIDGE_URL}/contacts/refresh",
-        data=b"",
-        headers={"Accept": "application/json"},
+        f"{WHATSAPP_BRIDGE_URL}/media/retry",
+        data=json.dumps({"message": raw_data}).encode("utf-8"),
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with urlopen(bridge_request, timeout=120) as response:
+        with urlopen(bridge_request, timeout=180) as response:
             result = json.load(response)
-        scan_whatsapp_events(WHATSAPP_EVENTS_DIR, SessionFactory, MEDIA_DIR)
+        _scan_live_events()
+        with SessionFactory() as session:
+            available = session.scalar(select(Media.id).where(Media.message_id == message_id)) is not None
+        if not available:
+            return JSONResponse({"error": "Video is not available"}, status_code=503)
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
     except HTTPError as error:
-        try:
-            detail = json.loads(error.read())
-        except (ValueError, OSError):
-            detail = {"error": "Contact refresh rejected"}
-        return JSONResponse(detail, status_code=error.code, headers={"Cache-Control": "no-store"})
+        return JSONResponse({"error": "Video could not be downloaded"}, status_code=error.code)
     except Exception as error:
-        raise HTTPException(status_code=503, detail="Could not refresh contacts") from error
+        raise HTTPException(status_code=503, detail="Could not retry video download") from error
 
 
 def _display_message_text(message: Message) -> str:
@@ -363,31 +320,38 @@ def _display_reaction(text: str) -> str:
 
 def _display_chat_name(chat_id: int, title: str) -> str:
     identifier, separator, domain = title.rpartition("@")
-    if separator and identifier.isdigit() and domain in {"lid", "s.whatsapp.net", "c.us"}:
+    if separator and identifier.isdigit() and domain in {"s.whatsapp.net", "c.us"}:
+        return f"+{identifier}"
+    if separator and identifier.isdigit() and domain == "lid":
         return f"Unbenannter Kontakt · {chat_id:03d}"
     return title
 
 
-def _resolve_lid_phone_jids(chats: list[tuple]) -> dict[str, str]:
+def _resolve_lid_phone_jids(chats: list[tuple], senders: tuple[str, ...] | list[str] = ()) -> dict[str, str]:
     jids = [title for _chat_id, title, *_rest in chats if title.endswith("@lid") and title[:-4].isdigit()]
+    jids.extend(sender for sender in senders if sender.endswith("@lid") and sender[:-4].isdigit())
+    jids = list(dict.fromkeys(jids))
     if not jids:
         return {}
-    request = Request(
-        f"{WHATSAPP_BRIDGE_URL}/resolve-lids",
-        data=json.dumps({"jids": jids}).encode("utf-8"),
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=1) as response:
-            resolved = json.load(response)
-        return {
-            lid: phone
-            for lid, phone in resolved.items()
-            if lid in jids and isinstance(phone, str) and phone.endswith("@s.whatsapp.net")
-        }
-    except Exception:
-        return {}
+    resolved: dict[str, str] = {}
+    for start in range(0, len(jids), 200):
+        batch = jids[start : start + 200]
+        request = Request(
+            f"{WHATSAPP_BRIDGE_URL}/resolve-lids",
+            data=json.dumps({"jids": batch}).encode("utf-8"),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=1) as response:
+                resolved.update(json.load(response))
+        except (OSError, ValueError):
+            continue
+    return {
+        lid: phone
+        for lid, phone in resolved.items()
+        if lid in jids and isinstance(phone, str) and phone.endswith("@s.whatsapp.net")
+    }
 
 
 def _chat_view_names(chats: list[tuple], lid_phone_jids: dict[str, str]) -> tuple[dict[int, str], set[int]]:
@@ -404,16 +368,11 @@ def _chat_view_names(chats: list[tuple], lid_phone_jids: dict[str, str]) -> tupl
         identity_key = hashlib.sha256(phone_jid.strip().casefold().encode("utf-8")).hexdigest()
         contact = chats_by_identity.get(identity_key)
         if contact is None:
+            display_names[chat_id] = _display_chat_name(chat_id, phone_jid)
             continue
         contact_id, contact_name, contact_message_count = contact
-        contact_name_is_real = _display_chat_name(contact_id, contact_name) == contact_name
-        lid_name = _display_chat_name(chat_id, title)
-        if contact_name_is_real:
-            display_names[chat_id] = contact_name
-        elif lid_name != title:
-            display_names[chat_id] = lid_name
-        else:
-            continue
+        contact_display_name = _display_chat_name(contact_id, contact_name)
+        display_names[chat_id] = contact_display_name
         if chat_id != contact_id and message_count > 0 and contact_message_count == 0:
             hidden_chat_ids.add(contact_id)
         elif chat_id != contact_id and message_count == 0 and contact_message_count > 0:
@@ -421,7 +380,7 @@ def _chat_view_names(chats: list[tuple], lid_phone_jids: dict[str, str]) -> tupl
     return display_names, hidden_chat_ids
 
 
-def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
+def _page(query: str, selected_chat: int | None) -> str:
     whatsapp_status = _whatsapp_status()
     state_labels = {
         "bridge_unavailable": "Bridge nicht erreichbar",
@@ -439,9 +398,9 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
     qr_panel = ""
     if qr_data_url:
         qr_panel = (
-            '<div class="pairing"><img src="{}" alt="WhatsApp-Verknüpfungs-QR-Code">'
+            f'<div class="pairing"><img src="{html.escape(qr_data_url, quote=True)}" alt="WhatsApp-Verknüpfungs-QR-Code">'
             '<span>In WhatsApp unter Verknüpfte Geräte scannen. Den Code nicht weitergeben.</span></div>'
-        ).format(html.escape(qr_data_url, quote=True))
+        )
     elif whatsapp_status.get("state") == "logged_out":
         qr_panel = (
             '<div class="pairing"><button type="button" id="pairing-reset">Neue lokale Kopplung</button>'
@@ -475,7 +434,6 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
             .group_by(Chat.id, Chat.title, Chat.identity_key)
             .order_by(Chat.title.collate("NOCASE"))
         ).all()
-        archive_state_by_id = dict(session.execute(select(Chat.id, Chat.is_archived)).all())
         reactions_by_message: dict[int, list[str]] = {}
         if selected_chat is not None:
             source_ids = {
@@ -512,7 +470,6 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
             pattern = f"%{query}%"
             statement = statement.where(or_(Message.text.ilike(pattern), Message.sender.ilike(pattern)))
         messages = session.execute(statement.order_by(Message.sent_at.desc(), Message.id.desc()).limit(100)).all()
-        imports = session.scalars(select(ImportRecord).order_by(ImportRecord.created_at.desc()).limit(8)).all()
         message_ids = [message.id for message, _chat_title in messages]
         media_rows = (
             session.scalars(select(Media).where(Media.message_id.in_(message_ids))).all() if message_ids else []
@@ -529,45 +486,63 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
         for version in version_rows:
             versions_by_message.setdefault(version.message_id, []).append(version)
 
-    lid_phone_jids = _resolve_lid_phone_jids(chats)
+    lid_phone_jids = _resolve_lid_phone_jids(chats, tuple(message.sender for message, _title in messages if message.sender))
     resolved_chat_names, hidden_chat_ids = _chat_view_names(chats, lid_phone_jids)
     visible_chats = [chat for chat in chats if chat[0] not in hidden_chat_ids]
     display_name_by_chat_id = {
         chat_id: resolved_chat_names.get(chat_id, _display_chat_name(chat_id, title))
         for chat_id, title, _identity_key, _message_count, _last_message_at in visible_chats
     }
-    active_chats = [row for row in visible_chats if archive_state_by_id.get(row[0]) is not True]
-    archived_chats = [row for row in visible_chats if archive_state_by_id.get(row[0]) is True]
-    for section in (active_chats, archived_chats):
-        section.sort(key=lambda row: display_name_by_chat_id[row[0]].casefold())
-        section.sort(key=lambda row: (row[4] is not None, row[4]), reverse=True)
-    visible_chats = active_chats + archived_chats
+    visible_chats.sort(
+        key=lambda row: (row[4] is not None, row[4], display_name_by_chat_id[row[0]].casefold(), row[0]),
+        reverse=True,
+    )
     chat_display_name_by_id = {
         chat_id: resolved_chat_names.get(chat_id, _display_chat_name(chat_id, title))
         for chat_id, title, _identity_key, _message_count, _last_message_at in chats
     }
-
-    chat_links = []
-    for section, section_label in ((active_chats, ""), (archived_chats, "Archivierte Chats")):
-        if not section:
+    display_name_by_jid = {
+        title: chat_display_name_by_id[chat_id]
+        for chat_id, title, _identity_key, _message_count, _last_message_at in chats
+    }
+    contact_by_identity = {identity_key: (chat_id, title) for chat_id, title, identity_key, *_rest in chats}
+    for lid, phone in lid_phone_jids.items():
+        phone_identity = hashlib.sha256(phone.strip().casefold().encode("utf-8")).hexdigest()
+        contact = contact_by_identity.get(phone_identity)
+        if contact is None:
+            display_name_by_jid[lid] = _display_chat_name(0, phone)
             continue
-        if section_label:
-            chat_links.append(f'<div class="chat-divider" role="presentation">{section_label}</div>')
-        for chat_id, _chat_title, _identity_key, message_count, _last_message_at in section:
-            chat_links.append(
-                '<a class="chat-link{}" href="/chats/{}"><span>{}</span><small>{}</small></a>'.format(
-                    " selected" if chat_id == selected_chat else "",
-                    chat_id,
-                    html.escape(display_name_by_chat_id[chat_id]),
-                    message_count,
-                )
-            )
+        contact_id, contact_title = contact
+        display_name_by_jid[lid] = resolved_chat_names.get(
+            contact_id,
+            _display_chat_name(contact_id, contact_title),
+        )
+
+    chat_links = [
+        '<a class="chat-link{}" href="/chats/{}"><span>{}</span><small>{}</small></a>'.format(
+            " selected" if chat_id == selected_chat else "",
+            chat_id,
+            html.escape(display_name_by_chat_id[chat_id]),
+            message_count,
+        )
+        for chat_id, _chat_title, _identity_key, message_count, _last_message_at in visible_chats
+    ]
     if not chat_links:
         chat_links = ['<p class="empty">Noch keine Chats importiert.</p>']
 
     message_html: list[str] = []
     for message, chat_title in messages:
         media_html = "".join(_render_media(item, message) for item in media_by_message.get(message.id, []))
+        if not media_html and message.deleted_at is None and message.raw_data:
+            try:
+                raw_content = json.loads(message.raw_data).get("message") or {}
+            except (TypeError, ValueError):
+                raw_content = {}
+            if isinstance(raw_content, dict) and "videoMessage" in raw_content:
+                media_html = (
+                    f'<button class="media-retry" type="button" data-message-id="{message.id}">Video erneut laden</button>'
+                    f'<small class="media-retry-status" id="media-retry-{message.id}" hidden></small>'
+                )
         reactions = reactions_by_message.get(message.id, [])
         reaction_html = (
             '<div class="message-reactions">{}</div>'.format(
@@ -576,9 +551,8 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
             if reactions
             else ""
         )
-        sender = message.sender or chat_display_name_by_id.get(message.chat_id, chat_title)
-        if sender.endswith("@lid") and message.chat_id in resolved_chat_names:
-            sender = resolved_chat_names[message.chat_id]
+        sender_key = message.sender or chat_display_name_by_id.get(message.chat_id, chat_title)
+        sender = display_name_by_jid.get(sender_key, _display_chat_name(message.chat_id, sender_key))
         previous = versions_by_message.get(message.id, [])
         versions_html = ""
         if previous:
@@ -611,21 +585,7 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
     if not message_html:
         message_html = ['<p class="empty">Keine passenden Nachrichten.</p>']
 
-    import_rows = []
-    for record in imports:
-        status = "Importiert" if record.status == "complete" else "Fehler: " + (record.error_code or "unbekannt")
-        warning_count = len(json.loads(record.warnings or "[]"))
-        if warning_count:
-            status += f" · {warning_count} Hinweis(e)"
-        import_rows.append(
-            '<li><span>{}</span><small>{} · {} Nachrichten</small></li>'.format(
-                html.escape(record.original_name), html.escape(status), record.messages_added
-            )
-        )
-    import_list = "".join(import_rows) or '<li class="empty">Noch keine Importe.</li>'
     safe_query = html.escape(query, quote=True)
-    safe_notice = f'<p class="notice">{html.escape(notice)}</p>' if notice else ""
-    hidden_chat = f'<input type="hidden" name="chat" value="{selected_chat}">' if selected_chat else ""
     clear_filter = '<a class="clear-filter" href="/">Alle Chats</a>' if selected_chat or query else ""
     selected_title = next(
         (resolved_chat_names.get(chat_id, _display_chat_name(chat_id, name)) for chat_id, name, _identity, _count, _last_message_at in chats if chat_id == selected_chat),
@@ -640,12 +600,10 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
             f'<input name="name" maxlength="500" required value="{html.escape(selected_title, quote=True)}" aria-label="Anzeigename">'
             '<button type="submit">Anzeigename speichern</button></form>'
         )
-    contact_refresh_disabled = "" if whatsapp_status.get("paired") else " disabled"
     chat_sidebar = (
-        f'<aside><div class="chat-sidebar-heading"><h2>Chats · {len(visible_chats)}</h2>'
-        f'<button type="button" id="contact-refresh"{contact_refresh_disabled}>Chats und Kontakte aktualisieren</button></div>'
+        f'<aside><div class="chat-sidebar-heading"><h2>Chats · {len(visible_chats)}</h2></div>'
         f'<nav class="chat-list">{"".join(chat_links)}</nav>'
-        f'<section class="recent"><h2>Letzte Importe</h2><ul>{import_list}</ul></section></aside>'
+        '</aside>'
     )
     conversation_class = ""
     conversation_back = ""
@@ -666,15 +624,10 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
     h1 {{ margin: 0; font: 600 25px/1.1 Georgia, serif; }}
     .status {{ color: var(--green); font-size: 13px; }}
     main {{ max-width: 1440px; margin: 0 auto; padding: 28px clamp(16px, 3vw, 42px); }}
-    .import-section {{ display: grid; grid-template-columns: minmax(180px, 0.7fr) 2fr; gap: 24px; align-items: start; padding: 0 0 24px; border-bottom: 1px solid var(--line); }}
     h2 {{ margin: 0 0 14px; font-size: 15px; font-weight: 650; }}
-    .import-fields {{ display: grid; grid-template-columns: minmax(160px, 1fr) minmax(180px, 1.4fr) auto; gap: 10px; align-items: end; }}
-    label {{ display: grid; gap: 6px; color: var(--muted); font-size: 12px; }}
-    input, select, button {{ min-height: 42px; border: 1px solid var(--line); border-radius: 4px; background: var(--white); color: var(--ink); font: inherit; padding: 8px 10px; }}
-    input[type=file] {{ min-width: 0; padding: 6px; font-size: 12px; }}
+    input, button {{ min-height: 42px; border: 1px solid var(--line); border-radius: 4px; background: var(--white); color: var(--ink); font: inherit; padding: 8px 10px; }}
     button {{ padding: 8px 16px; background: var(--green); border-color: var(--green); color: var(--white); cursor: pointer; font-weight: 600; }}
     button:hover {{ background: #0e543f; }}
-    .notice {{ grid-column: 1 / -1; margin: 0; padding: 10px 12px; background: var(--green-soft); border-left: 3px solid var(--green); }}
     .layout {{ display: grid; grid-template-columns: minmax(220px, 290px) minmax(0, 1fr); gap: 32px; padding-top: 26px; }}
     .conversation-layout {{ grid-template-columns: minmax(0, 1fr); }}
     aside {{ border-right: 1px solid var(--line); padding-right: 22px; }}
@@ -682,16 +635,10 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
     .chat-sidebar-heading h2 {{ margin: 0; }}
     .chat-sidebar-heading button {{ min-height: 32px; padding: 4px 8px; font-size: 11px; }}
     .chat-list {{ display: grid; gap: 3px; }}
-    .chat-divider {{ display: flex; align-items: center; gap: 8px; margin: 8px 8px 3px; color: var(--muted); font-size: 11px; }}
-    .chat-divider::before, .chat-divider::after {{ content: ""; height: 1px; flex: 1; background: var(--line); }}
     .chat-link {{ display: flex; justify-content: space-between; align-items: baseline; gap: 10px; min-width: 0; padding: 11px 10px; border-radius: 3px; color: var(--ink); text-decoration: none; }}
     .chat-link span {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .chat-link small, .chat-link.selected small {{ color: var(--muted); }}
     .chat-link:hover, .chat-link.selected {{ background: var(--green-soft); color: var(--green); }}
-    .recent {{ margin-top: 32px; }}
-    .recent ul {{ margin: 0; padding: 0; list-style: none; }}
-    .recent li {{ padding: 8px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }}
-    .recent li small {{ display: block; margin-top: 4px; color: var(--muted); }}
     .feed-head {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }}
     .feed-head h2 {{ margin: 0; font: 600 21px/1.2 Georgia, serif; }}
     .feed-title {{ display: grid; gap: 8px; min-width: 0; }}
@@ -717,6 +664,8 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
     .media-preview {{ display: block; max-width: min(100%, 640px); margin-top: 10px; }}
     .media-preview img, .media-preview video {{ display: block; max-width: 100%; max-height: 420px; border-radius: 4px; }}
     .media-preview audio {{ display: block; width: min(100%, 420px); }}
+    .media-retry {{ margin-top: 10px; }}
+    .media-retry-status {{ color: var(--coral); font-size: 12px; }}
     .connection {{ display: flex; align-items: center; gap: 22px; padding: 0 0 22px; border-bottom: 1px solid var(--line); }}
     .connection-copy {{ min-width: 220px; }}
     .connection-state {{ margin: 0 0 5px; color: var(--green); font-weight: 650; }}
@@ -729,7 +678,7 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
     .versions summary {{ cursor: pointer; }}
     .versions p {{ border-left: 2px solid var(--line); padding-left: 9px; }}
     .empty {{ color: var(--muted); font-size: 13px; }}
-    @media (max-width: 760px) {{ .connection {{ align-items: flex-start; flex-direction: column; gap: 10px; }} .connection-copy {{ min-width: 0; }} .pairing {{ align-items: flex-start; }} .import-section {{ grid-template-columns: 1fr; gap: 8px; }} .import-fields {{ grid-template-columns: 1fr 1fr; }} .import-fields label:first-child {{ grid-column: 1 / -1; }} .import-fields button {{ grid-column: 1 / -1; }} .layout {{ grid-template-columns: 1fr; gap: 22px; }} aside {{ border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 18px; }} .chat-list {{ display: flex; overflow-x: auto; padding-bottom: 4px; }} .chat-link {{ flex: 0 0 auto; max-width: 220px; }} .recent {{ display: none; }} .feed-head {{ align-items: flex-start; flex-direction: column; }} .search {{ width: 100%; }} }}
+    @media (max-width: 760px) {{ .connection {{ align-items: flex-start; flex-direction: column; gap: 10px; }} .connection-copy {{ min-width: 0; }} .pairing {{ align-items: flex-start; }} .layout {{ grid-template-columns: 1fr; gap: 22px; }} aside {{ border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 18px; }} .chat-list {{ display: flex; overflow-x: auto; padding-bottom: 4px; }} .chat-link {{ flex: 0 0 auto; max-width: 220px; }} .feed-head {{ align-items: flex-start; flex-direction: column; }} .search {{ width: 100%; }} }}
   </style>
 </head>
 <body>
@@ -739,16 +688,6 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
             <div class="connection-copy"><p class="connection-state" id="connection-state">{state_label}</p><small class="connection-counts" id="connection-counts">{archive_counts}</small>{bridge_error_html}</div>
             <div id="pairing-area">{qr_panel}</div>
         </section>
-    <section class="import-section">
-      <h2>Export importieren</h2>
-      <form class="import-fields" action="/imports" method="post" enctype="multipart/form-data">
-        <label>Chatname<input name="title" maxlength="500" required placeholder="z. B. Familie"></label>
-        <label>WhatsApp-Export<input name="file" type="file" accept=".txt,.zip" required></label>
-        <label>Datumsformat<select name="date_order"><option value="day-first">Tag / Monat</option><option value="month-first">Monat / Tag</option></select></label>
-        <button type="submit">Importieren</button>
-      </form>
-      {safe_notice}
-    </section>
         <div class="layout{conversation_class}">
             {chat_sidebar}
       <section>
@@ -790,9 +729,9 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
             const instant = new Date(element.dataset.utc);
             if (!Number.isNaN(instant.getTime())) element.textContent = localDateTime.format(instant);
         }});
-        const renderedArchiveCounts = [{whatsapp_status.get('archived_chats', 0)}, {whatsapp_status.get('archived_messages', 0)}];
-        let previousArchiveCounts = null;
-        let stableArchiveCountPolls = 0;
+        const renderedLiveRevision = Number({whatsapp_status.get('live_revision', 0)});
+        let previousLiveRevision = null;
+        let stableLiveRevisionPolls = 0;
         async function refreshWhatsAppStatus() {{
             try {{
                 const response = await fetch('/api/whatsapp/status', {{ cache: 'no-store' }});
@@ -801,18 +740,15 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
                 const labels = {{ bridge_unavailable: 'Bridge nicht erreichbar', starting: 'Verbindung startet', pairing_required: 'QR-Kopplung erforderlich', connected: 'Verbunden', syncing_history: 'Chatverlauf wird synchronisiert', reconnecting: 'Verbindung wird wiederhergestellt', logged_out: 'Abgemeldet', error: 'Verbindungsfehler', mock: 'Testmodus' }};
                 document.getElementById('connection-state').textContent = labels[state.state] || 'Unbekannter Status';
                 document.getElementById('connection-counts').textContent = `${{state.archived_chats}} Chats · ${{state.archived_messages}} Nachrichten im Archiv`;
-                const contactRefresh = document.getElementById('contact-refresh');
-                if (contactRefresh) contactRefresh.disabled = !state.paired || state.state === 'syncing_history';
-                const currentArchiveCounts = [Number(state.archived_chats || 0), Number(state.archived_messages || 0)];
-                const changedSinceRender = currentArchiveCounts.some((count, index) => count !== renderedArchiveCounts[index]);
-                const archiveCountsKey = currentArchiveCounts.join(':');
-                if (changedSinceRender && archiveCountsKey === previousArchiveCounts) {{
-                    stableArchiveCountPolls += 1;
+                const liveRevision = Number(state.live_revision || 0);
+                const changedSinceRender = liveRevision !== renderedLiveRevision;
+                if (changedSinceRender && liveRevision === previousLiveRevision) {{
+                    stableLiveRevisionPolls += 1;
                 }} else {{
-                    stableArchiveCountPolls = changedSinceRender ? 1 : 0;
+                    stableLiveRevisionPolls = changedSinceRender ? 1 : 0;
                 }}
-                previousArchiveCounts = archiveCountsKey;
-                if (stableArchiveCountPolls >= 2 && !['starting', 'syncing_history', 'reconnecting'].includes(state.state)) {{
+                previousLiveRevision = liveRevision;
+                if (stableLiveRevisionPolls >= 2 && !['starting', 'syncing_history', 'reconnecting'].includes(state.state)) {{
                     window.location.reload();
                     return;
                 }}
@@ -829,6 +765,23 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
             }} catch {{}}
         }}
         document.addEventListener('click', async (event) => {{
+            const button = event.target.closest('.media-retry');
+            if (!button || button.disabled) return;
+            const status = document.getElementById(`media-retry-${{button.dataset.messageId}}`);
+            button.disabled = true;
+            button.textContent = 'Video wird geladen …';
+            try {{
+                const response = await fetch(`/api/media/${{button.dataset.messageId}}/retry`, {{ method: 'POST' }});
+                if (!response.ok) throw new Error('Video retry failed');
+                window.location.reload();
+            }} catch {{
+                button.disabled = false;
+                button.textContent = 'Video erneut laden';
+                status.textContent = 'Video konnte nicht geladen werden. Bitte später erneut versuchen.';
+                status.hidden = false;
+            }}
+        }});
+        document.addEventListener('click', async (event) => {{
             const button = event.target.closest('#pairing-reset');
             if (!button) return;
             if (!window.confirm('Die lokale WhatsApp-Sitzung wird entfernt. Danach wird ein neuer QR-Code angefordert. Fortfahren?')) return;
@@ -843,20 +796,6 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
                 button.textContent = 'Neue lokale Kopplung';
             }}
         }});
-        document.addEventListener('click', async (event) => {{
-            const button = event.target.closest('#contact-refresh');
-            if (!button || button.disabled) return;
-            button.disabled = true;
-            button.textContent = 'Chats und Kontakte werden aktualisiert …';
-            try {{
-                const response = await fetch('/api/whatsapp/contacts/refresh', {{ method: 'POST' }});
-                if (!response.ok) throw new Error('Contact refresh failed');
-                window.location.reload();
-            }} catch {{
-                button.disabled = false;
-                button.textContent = 'Chats und Kontakte aktualisieren';
-            }}
-        }});
         window.setInterval(refreshWhatsAppStatus, 2500);
     </script>
 </body>
@@ -867,7 +806,6 @@ def _page(query: str, selected_chat: int | None, notice: str = "") -> str:
 def index(
     q: str = Query(default="", max_length=200),
     chat: int | None = Query(default=None),
-    notice: str = Query(default="", max_length=300),
 ) -> HTMLResponse:
     if chat is None:
         with SessionFactory() as session:
@@ -879,7 +817,7 @@ def index(
                 .limit(1)
             )
     return HTMLResponse(
-        _page(q, chat, notice),
+        _page(q, chat),
         headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"},
     )
 
@@ -909,42 +847,6 @@ def rename_chat(chat_id: int, request: FastAPIRequest, name: str = Form(..., max
             raise HTTPException(status_code=404, detail="Chat not found")
         chat.title = title
     return RedirectResponse(f"/chats/{chat_id}", status_code=303)
-
-
-@app.post("/imports")
-def upload_export(
-    title: str = Form(..., max_length=500),
-    date_order: str = Form("day-first"),
-    file: UploadFile = File(...),
-):
-    if date_order not in {"day-first", "month-first"}:
-        raise HTTPException(status_code=400, detail="Unsupported date order")
-    try:
-        source = save_upload(file, title, date_order, INCOMING_DIR)
-        outcome = import_export(
-            source,
-            title,
-            date_order,
-            SessionFactory,
-            MEDIA_DIR,
-            original_name=file.filename,
-        )
-        remember_upload(source)
-    except ValueError as exc:
-        return HTMLResponse(
-            _page("", None, str(exc)),
-            status_code=400,
-            headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"},
-        )
-    finally:
-        file.file.close()
-
-    message = (
-        "Dieser Export war bereits importiert."
-        if outcome.status == "already-imported"
-        else f"Import abgeschlossen: {outcome.messages_added} neue Nachrichten, {outcome.media_added} Medien."
-    )
-    return RedirectResponse("/?" + urlencode({"notice": message}), status_code=303)
 
 
 @app.get("/media/{media_id}")

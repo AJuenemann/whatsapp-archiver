@@ -1,6 +1,14 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -18,22 +26,6 @@ class Chat(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     identity_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     title: Mapped[str] = mapped_column(String(500))
-    is_archived: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
-
-
-class ImportRecord(Base):
-    __tablename__ = "imports"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    source_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    original_name: Mapped[str] = mapped_column(String(255))
-    chat_id: Mapped[int | None] = mapped_column(ForeignKey("chats.id"), nullable=True)
-    status: Mapped[str] = mapped_column(String(20), default="processing")
-    messages_added: Mapped[int] = mapped_column(Integer, default=0)
-    media_added: Mapped[int] = mapped_column(Integer, default=0)
-    warnings: Mapped[str] = mapped_column(Text, default="[]")
-    error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now)
 
 
