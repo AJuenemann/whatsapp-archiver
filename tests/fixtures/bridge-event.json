@@ -1,0 +1,12 @@
+{
+  "type": "message",
+  "jid": "synthetic-bridge-chat@g.us",
+  "title": "Synthetic Bridge Proof",
+  "sourceId": "synthetic-message-1:in:synthetic-participant",
+  "timestamp": "2026-10-12T09:00:00Z",
+  "sender": "Synthetic sender",
+  "text": "Bridge event imported through the archive queue",
+  "rawData": {
+    "source": "synthetic test fixture"
+  }
+}
